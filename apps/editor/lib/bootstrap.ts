@@ -7,6 +7,7 @@ import {
   registerNode,
 } from '@pascal-app/core'
 import { registerEditorHostPanel } from '@pascal-app/editor'
+import { fireRiskHostPanel } from '@pascal-app/fire-risk-extension'
 import { builtinPlugin } from '@pascal-app/nodes'
 import { treesHostPanel, treesPlugin } from '@pascal-app/plugin-trees'
 
@@ -85,6 +86,7 @@ export async function loadExternalPlugins(): Promise<void> {
 // so it is registered separately from the core plugin manifest.
 extendPluginDiscovery(async () => [treesPlugin])
 registerEditorHostPanel(treesHostPanel)
+registerEditorHostPanel(fireRiskHostPanel)
 
 loadBuiltinsSync()
 void loadExternalPlugins()
