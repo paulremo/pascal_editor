@@ -345,7 +345,6 @@ export default function DoorPanel() {
   const showHandleSection = isSwingDoor
   const showHardwareSection = isSwingDoor
   const showSegmentsSection = !isCutoutOnly && !isGarageDoor
-  const maxDoorWidth = isGarageDoor ? 6 : 3
 
   const setOpeningTopRadius = (index: number, value: number, commit = false) => {
     const next = [...openingTopRadii] as [number, number]
@@ -703,7 +702,6 @@ export default function DoorPanel() {
       <PanelSection title="Dimensions">
         <SliderControl
           label="Width"
-          max={maxDoorWidth}
           min={0.5}
           onChange={(v) => handleUpdate({ width: v })}
           precision={2}
@@ -714,7 +712,6 @@ export default function DoorPanel() {
         />
         <SliderControl
           label="Height"
-          max={4}
           min={1.0}
           onChange={(v) =>
             handleUpdate({
