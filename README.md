@@ -380,6 +380,30 @@ bun dev
 
 **Important:** Always run `bun dev` from the root directory to ensure the package watchers are running. This enables hot reload when you edit files in `packages/core/src/` or `packages/viewer/src/`.
 
+### Local production instance
+
+To run a complete local Pascal instance from this checkout, rather than the
+hot-reload development server, build the editor and start Next.js in production
+mode. The commands below use PowerShell and assume Bun and Node.js 20.9 or later
+are installed:
+
+```powershell
+bun install --frozen-lockfile
+bunx turbo run build --filter=editor
+
+$env:NODE_ENV = "production"
+$env:PORT = "3000"
+$env:MINT_PASCAL_HOST_ORIGIN = "http://localhost:3000"
+$env:PASCAL_DATA_DIR = "$env:LOCALAPPDATA\Pascal\data"
+
+bun --cwd apps/editor run start
+```
+
+Open http://localhost:3000. `PASCAL_DATA_DIR` keeps the local SQLite scene
+database outside the repository; use the same location between launches to
+retain scenes. Stop the instance with `Ctrl+C`. Do not use `bun dev` for this
+production-instance workflow.
+
 ### Building for Production
 
 ```bash
