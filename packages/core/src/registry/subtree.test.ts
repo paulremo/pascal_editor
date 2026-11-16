@@ -1,6 +1,6 @@
 import { describe, expect, test } from 'bun:test'
 import type { AnyNode, AnyNodeId } from '../schema/types'
-import { cloneNodesInto, collectSubtree } from './subtree'
+import { cloneNodesInto, collectSubtree, withoutSourceIdentity } from './subtree'
 
 function makeNode(id: string, type: string, extra: Record<string, unknown> = {}): AnyNode {
   return {
@@ -115,6 +115,117 @@ describe('cloneNodesInto', () => {
     }
   })
 
+  test('remaps associative measurement references inside the cloned subtree', () => {
+    const wall = makeNode('wall_1', 'wall', { parentId: 'level_1' })
+    const measurement = makeNode('measurement_1', 'measurement', {
+      parentId: 'level_1',
+      measurement: {
+        kind: 'distance',
+        points: [
+          {
+            kind: 'feature',
+            reference: { nodeId: 'wall_1', featureId: 'wall:start' },
+            fallback: [0, 0, 0],
+          },
+          [1, 0, 0],
+        ],
+      },
+    })
+    const result = cloneNodesInto([wall, measurement], {
+      rootId: 'wall_1' as AnyNodeId,
+    })
+    const clonedMeasurement = result.nodes.find((node) => node.type === 'measurement')
+
+    expect(clonedMeasurement?.type).toBe('measurement')
+    if (
+      clonedMeasurement?.type === 'measurement' &&
+      clonedMeasurement.measurement.kind === 'distance'
+    ) {
+      const anchor = clonedMeasurement.measurement.points[0]
+      expect(Array.isArray(anchor)).toBe(false)
+      if (anchor && !Array.isArray(anchor)) {
+        expect(anchor.reference.nodeId).toBe(result.idMap.get('wall_1' as AnyNodeId)!)
+      }
+    }
+  })
+
+  test('remaps associative construction-dimension anchors inside the cloned subtree', () => {
+    const wall = makeNode('wall_1', 'wall', { parentId: 'level_1' })
+    const dimension = makeNode('construction-dimension_1', 'construction-dimension', {
+      parentId: 'level_1',
+      anchors: [
+        {
+          kind: 'feature',
+          reference: { nodeId: 'wall_1', featureId: 'wall:start' },
+          fallback: [0, 0, 0],
+        },
+        [1, 0, 0],
+        {
+          kind: 'feature',
+          reference: { nodeId: 'wall_1', featureId: 'wall:end' },
+          fallback: [2, 0, 0],
+        },
+      ],
+      baseline: { origin: [0, 1], direction: [1, 0] },
+      chainMode: 'continuous',
+    })
+    const result = cloneNodesInto([wall, dimension], {
+      rootId: 'wall_1' as AnyNodeId,
+    })
+    const clonedDimension = result.nodes.find((node) => node.type === 'construction-dimension')
+
+    expect(clonedDimension?.type).toBe('construction-dimension')
+    if (clonedDimension?.type === 'construction-dimension') {
+      const anchor = clonedDimension.anchors[0]
+      expect(Array.isArray(anchor)).toBe(false)
+      if (anchor && !Array.isArray(anchor)) {
+        expect(anchor.reference.nodeId).toBe(result.idMap.get('wall_1' as AnyNodeId)!)
+      }
+      const lastAnchor = clonedDimension.anchors[2]
+      expect(Array.isArray(lastAnchor)).toBe(false)
+      if (lastAnchor && !Array.isArray(lastAnchor)) {
+        expect(lastAnchor.reference.nodeId).toBe(result.idMap.get('wall_1' as AnyNodeId)!)
+      }
+    }
+  })
+
+  test('remaps a construction dimension foundation controller when both are cloned', () => {
+    const controller = makeNode('construction-dimension_foundation', 'construction-dimension', {
+      parentId: 'level_1',
+      anchors: [
+        [0, 0, 0],
+        [4, 0, 0],
+      ],
+      baseline: { origin: [0, 1], direction: [1, 0] },
+      drawingType: 'foundation-plan',
+    })
+    const dependent = makeNode('construction-dimension_floor', 'construction-dimension', {
+      parentId: 'level_1',
+      anchors: [
+        [0, 0, 0],
+        [1, 0, 0],
+      ],
+      baseline: { origin: [0, 1], direction: [1, 0] },
+      controllingDimensionId: controller.id,
+    })
+
+    const result = cloneNodesInto([controller, dependent], {
+      rootId: controller.id as AnyNodeId,
+    })
+    const clonedDependent = result.nodes.find(
+      (node) => node.id === result.idMap.get(dependent.id as AnyNodeId),
+    )
+
+    expect(clonedDependent?.type).toBe('construction-dimension')
+    if (clonedDependent?.type === 'construction-dimension') {
+      expect(clonedDependent.controllingDimensionId).toBe(
+        result.idMap.get(
+          controller.id as AnyNodeId,
+        ) as typeof clonedDependent.controllingDimensionId,
+      )
+    }
+  })
+
   test('parents the cloned root under opts.parentId when supplied', () => {
     const orig = makeNode('shelf_1', 'shelf', { parentId: 'level_old' })
     const { nodes } = cloneNodesInto([orig], {
@@ -140,5 +251,59 @@ describe('cloneNodesInto', () => {
   test('throws if rootId is missing from the input array', () => {
     const orig = makeNode('shelf_1', 'shelf', {})
     expect(() => cloneNodesInto([orig], { rootId: 'shelf_other' as AnyNodeId })).toThrow(/rootId/)
+  })
+})
+
+describe('withoutSourceIdentity (preset save, D5)', () => {
+  const wallProvenance = {
+    refs: [{ ns: 'al', id: 'ground-exterior-01' }],
+    lineage: { op: 'split', fromIds: ['wall_before'] },
+  }
+  const windowProvenance = {
+    refs: [
+      { ns: 'al', id: 'roof-native-134755-83', role: 'absorbed' },
+      { ns: 'al', id: 'roof-native-135186-86', role: 'absorbed' },
+    ],
+  }
+  const imported = (): Record<AnyNodeId, AnyNode> => ({
+    ['level_l' as AnyNodeId]: makeNode('level_l', 'level', { children: ['wall_a'] }),
+    ['wall_a' as AnyNodeId]: makeNode('wall_a', 'wall', {
+      parentId: 'level_l',
+      children: ['window_a'],
+      metadata: { sourceIds: ['ground-exterior-01'], expressID: 42 },
+      provenance: wallProvenance,
+    }),
+    ['window_a' as AnyNodeId]: makeNode('window_a', 'window', {
+      parentId: 'wall_a',
+      wallId: 'wall_a',
+      provenance: windowProvenance,
+    }),
+  })
+
+  test('an imported node saved as a preset and placed again claims no source element', () => {
+    const scene = imported()
+    const subtree = collectSubtree(scene, 'wall_a' as AnyNodeId)!
+    const stored = JSON.stringify({
+      root: withoutSourceIdentity(subtree.root),
+      descendants: subtree.descendants.map(withoutSourceIdentity),
+    })
+
+    const preset = JSON.parse(stored) as { root: AnyNode; descendants: AnyNode[] }
+    const placed = cloneNodesInto([preset.root, ...preset.descendants], {
+      rootId: preset.root.id,
+      parentId: 'level_l' as AnyNodeId,
+    })
+    expect(placed.nodes).toHaveLength(2)
+    for (const node of placed.nodes) expect(Object.hasOwn(node, 'provenance')).toBe(false)
+    // The saved-from nodes keep their identity.
+    expect((scene['wall_a' as AnyNodeId] as any).provenance).toEqual(wallProvenance)
+    expect((scene['window_a' as AnyNodeId] as any).provenance).toEqual(windowProvenance)
+  })
+
+  test('drops the importer source ids too and keeps every other field, IFC ids included', () => {
+    const wall = imported()['wall_a' as AnyNodeId]!
+    const { provenance: _, ...rest } = wall as AnyNode & { provenance?: unknown }
+    // `metadata.sourceIds[]` is a `source` row the inventory strips on preset; `expressID` keeps.
+    expect(withoutSourceIdentity(wall)).toEqual({ ...rest, metadata: { expressID: 42 } } as AnyNode)
   })
 })

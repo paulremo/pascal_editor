@@ -3,37 +3,52 @@ import {
   type AnyNodeId,
   bboxCornerAnchors,
   collectAlignmentAnchors,
+  emitter,
   pauseSceneHistory,
   pauseSpaceDetection,
   resolveAlignment,
   resumeSceneHistory,
   resumeSpaceDetection,
+  type SceneMaterialId,
   useLiveNodeOverrides,
   useLiveTransforms,
   useScene,
 } from '@pascal-app/core'
-import { useViewer } from '@pascal-app/viewer'
+import { isTypingTarget, markPerfAction, useViewer } from '@pascal-app/viewer'
 import { Plane, Vector2, Vector3 } from 'three'
 import { GROUP_MOVE_DRAG_LABEL } from '../../lib/contextual-help'
 import { clientToPlan } from '../../lib/floorplan/plan-coords'
-import { duplicateNodesToLevel } from '../../lib/scene-clipboard'
-import { sfxEmitter } from '../../lib/sfx-bus'
+import { deleteSelectedSeparator, requestRoomDeletion } from '../../lib/room-structure-commands'
+import { captureElementActionOrigin, completeElementAction } from '../../lib/room-zone-routing'
+import {
+  copySelectedNodesToEditorClipboard,
+  duplicateNodesToLevel,
+  getEditorClipboardSnapshot,
+  type PasteRefusal,
+  pasteSystemEditorClipboardToLevel,
+} from '../../lib/scene-clipboard'
+import { emitDeleteSFX, sfxEmitter } from '../../lib/sfx-bus'
 import useAlignmentGuides from '../../store/use-alignment-guides'
+import useDeleteConfirmation from '../../store/use-delete-confirmation'
 import useEditor, {
   isAlignmentGuideActive,
+  isBrushMode,
   isGridSnapActive,
   isMagneticSnapActive,
 } from '../../store/use-editor'
+import useFloorplanMode from '../../store/use-floorplan-mode'
 import useInteractionScope from '../../store/use-interaction-scope'
 import { useFloorplanGroupDrag } from '../editor-2d/floorplan-group-move'
 import {
+  beginGroupWallPush,
   classifyParticipant,
   collectParticipants,
   computeGroupBox,
-  expandToComponent,
+  groupPlanBounds,
   levelFrame,
-  participantExtents,
+  planBoundsCenter,
   rotateGroupSnapshots,
+  rotatePlanBounds,
   translateGroupPatches,
   type Vec2,
 } from './group-transform-shared'
@@ -72,69 +87,35 @@ export function canGroupPickUp(): boolean {
  * until a click commits, mirroring the single-node `movingNode` flow. Returns
  * false when the selection holds no transformable participants.
  *
- * `scopeToSelection` limits the moving set to the selected participants —
- * no connected-component expansion and no welded-neighbor endpoints. The
+ * `scopeToSelection` drops the welded-neighbor endpoints, so connected walls
+ * don't stretch along with the move. The
  * Duplicate flow needs this: its clones sit EXACTLY on the originals, so
  * junction coincidence would otherwise weld the originals into the pick-up
  * and drag them along with the copies.
  */
 export function startGroupPickUp(
-  opts: { onCancel?: () => void; scopeToSelection?: boolean } = {},
+  opts: { onCancel?: () => void; positionAtCursor?: boolean; scopeToSelection?: boolean } = {},
 ): boolean {
   const { selectedIds, levelId } = useViewer.getState().selection
   const participantIds = groupParticipantIds()
   if (participantIds.length === 0) return false
   const nodes = useScene.getState().nodes
-  const fullIds = opts.scopeToSelection
-    ? participantIds
-    : expandToComponent(participantIds, nodes, levelId)
-  const collected = collectParticipants(fullIds, nodes, levelId)
+  const collected = collectParticipants(participantIds, nodes, levelId)
   // Mutable: mid-carry R/T rotates these snapshots in place.
   let starts = collected.starts
   let links = opts.scopeToSelection ? [] : collected.links
   if (starts.length === 0) return false
   const affectedIds: AnyNodeId[] = [...starts.map((s) => s.id), ...links.map((l) => l.id)]
 
-  // Rest bounds in the level frame. Prefer the mounted meshes' world box
-  // (footprint-accurate), but fall back to the participant DATA when the
-  // meshes aren't up yet — Duplicate starts the pick-up synchronously after
-  // `createNodes`, one frame before the clones' renderers mount.
   const { inverse: frameInv } = levelFrame(levelId)
-  const restBox = computeGroupBox(fullIds)
-  let minX = Number.POSITIVE_INFINITY
-  let minZ = Number.POSITIVE_INFINITY
-  let maxX = Number.NEGATIVE_INFINITY
-  let maxZ = Number.NEGATIVE_INFINITY
-  if (restBox) {
-    const boxMin = restBox.min.clone().applyMatrix4(frameInv)
-    const boxMax = restBox.max.clone().applyMatrix4(frameInv)
-    minX = Math.min(boxMin.x, boxMax.x)
-    minZ = Math.min(boxMin.z, boxMax.z)
-    maxX = Math.max(boxMin.x, boxMax.x)
-    maxZ = Math.max(boxMin.z, boxMax.z)
-  } else {
-    const reach = (x: number, z: number) => {
-      minX = Math.min(minX, x)
-      minZ = Math.min(minZ, z)
-      maxX = Math.max(maxX, x)
-      maxZ = Math.max(maxZ, z)
-    }
-    for (const s of starts) {
-      if (s.kind === 'endpoint') {
-        reach(s.start[0], s.start[1])
-        reach(s.end[0], s.end[1])
-      } else if (s.kind === 'polygon') {
-        for (const [x, z] of s.polygon) {
-          reach(x, z)
-        }
-      } else {
-        reach(s.position[0], s.position[2])
-      }
-    }
-  }
-  if (!Number.isFinite(minX)) return false
+  const restBox = computeGroupBox(participantIds)
+  const startBounds = groupPlanBounds(starts, frameInv)
+  if (!startBounds) return false
+  // Mutable: mid-carry R/T re-seeds the footprint around the same pivot.
+  let restBounds = startBounds
+  let carriedRotation = 0
   // Rotation pivot for mid-carry R/T; stable across the whole pick-up.
-  const restCenter: [number, number] = [(minX + maxX) / 2, (minZ + maxZ) / 2]
+  const restCenter = planBoundsCenter(restBounds)
   // Ground plane for the 3D surface: the meshes' base when available, floor
   // level otherwise. Placements live in the level frame, so both surfaces
   // resolve into it before measuring.
@@ -148,7 +129,13 @@ export function startGroupPickUp(
     if (n && !movingIdSet.has(nid)) staticNodes[nid] = n
   }
   const candidates = collectAlignmentAnchors(staticNodes, '', levelId)
-  let restAnchors = bboxCornerAnchors('group-move', minX, minZ, maxX, maxZ)
+  let restAnchors = bboxCornerAnchors(
+    'group-move',
+    restBounds.minX,
+    restBounds.minZ,
+    restBounds.maxX,
+    restBounds.maxZ,
+  )
 
   // Cursor → level-frame plan point, whichever surface the pointer is over.
   const ndc = new Vector2()
@@ -198,22 +185,28 @@ export function startGroupPickUp(
     handle: GROUP_MOVE_DRAG_LABEL,
   })
   document.body.style.cursor = 'grabbing'
+  // Walls alone move as their push arrows do; copies (paste, duplicate) are
+  // carried rigidly, joined to nothing yet.
+  const push = opts.scopeToSelection ? null : beginGroupWallPush(starts, levelId)
 
   const applyMove = (e: PointerEvent) => {
     const plan = resolvePlanPoint(e)
     if (!plan) return
-    // Delta-relative to where tracking starts so the group never teleports
-    // to the cursor.
-    if (!startPlan) {
+    // Ordinary moves are delta-relative so the group never teleports. A
+    // pasted selection instead arrives centered under the cursor.
+    if (!opts.positionAtCursor && !startPlan) {
       startPlan = plan
       return
     }
     const step = useEditor.getState().gridSnapStep
     const snap = isGridSnapActive() && step > 0
-    let dx = snap ? Math.round((plan[0] - startPlan[0]) / step) * step : plan[0] - startPlan[0]
-    let dz = snap ? Math.round((plan[1] - startPlan[1]) / step) * step : plan[1] - startPlan[1]
+    const rawDx = opts.positionAtCursor ? plan[0] - restCenter[0] : plan[0] - startPlan![0]
+    const rawDz = opts.positionAtCursor ? plan[1] - restCenter[1] : plan[1] - startPlan![1]
+    let dx = snap ? Math.round(rawDx / step) * step : rawDx
+    let dz = snap ? Math.round(rawDz / step) * step : rawDz
 
-    if (isAlignmentGuideActive() && candidates.length > 0 && restAnchors.length > 0) {
+    // Pushed walls don't move as one footprint, so they have no box to align.
+    if (!push && isAlignmentGuideActive() && candidates.length > 0 && restAnchors.length > 0) {
       const result = resolveAlignment({
         moving: restAnchors.map((a) => ({ ...a, x: a.x + dx, z: a.z + dz })),
         candidates,
@@ -235,6 +228,10 @@ export function startGroupPickUp(
     if (!lastDelta || lastDelta[0] !== dx || lastDelta[1] !== dz) {
       sfxEmitter.emit('sfx:grid-snap')
       lastDelta = [dx, dz]
+    }
+    if (push) {
+      push.preview([dx, dz])
+      return
     }
 
     const entries = translateGroupPatches(starts, links, dx, dz)
@@ -263,23 +260,28 @@ export function startGroupPickUp(
   // the current delta — the carried group turns exactly like the idle
   // keyboard rotate, and the placement stays a single updateNodes.
   const rotateCarried = (direction: 1 | -1) => {
-    const rotated = rotateGroupSnapshots(
-      starts,
-      links,
-      { x: restCenter[0], z: restCenter[1] },
-      -direction * (Math.PI / 4),
-    )
+    // Pushed walls keep their bearing: there is nothing to turn.
+    if (push) return
+    const pivot = { x: restCenter[0], z: restCenter[1] }
+    const delta = -direction * (Math.PI / 4)
+    const rotated = rotateGroupSnapshots(starts, links, pivot, delta)
     starts = rotated.starts
     links = rotated.links
-    const ext = participantExtents(rotated.starts)
-    if (ext) {
-      restAnchors = bboxCornerAnchors('group-move', ext.minX, ext.minZ, ext.maxX, ext.maxZ)
-    }
+    carriedRotation += delta
+    restBounds = rotatePlanBounds(startBounds, pivot, carriedRotation)
+    restAnchors = bboxCornerAnchors(
+      'group-move',
+      restBounds.minX,
+      restBounds.minZ,
+      restBounds.maxX,
+      restBounds.maxZ,
+    )
     sfxEmitter.emit('sfx:item-rotate')
     applyDelta(lastDelta?.[0] ?? 0, lastDelta?.[1] ?? 0)
   }
 
   const clearLivePreviews = () => {
+    push?.cancel()
     const overrides = useLiveNodeOverrides.getState()
     const liveTransforms = useLiveTransforms.getState()
     for (const id of affectedIds) {
@@ -312,6 +314,12 @@ export function startGroupPickUp(
   const commit = () => {
     swallowNextClick()
     sfxEmitter.emit('sfx:item-place')
+    if (push) {
+      resumeSceneHistory(useScene)
+      push.commit()
+      teardown()
+      return
+    }
     const overrides = useLiveNodeOverrides.getState()
     const updates: { id: AnyNodeId; data: Partial<AnyNode> }[] = []
     for (const id of affectedIds) {
@@ -361,6 +369,7 @@ export function startGroupPickUp(
     // Only a press over a tracked surface commits; a click on side panels or
     // the toolbar keeps the pick-up alive.
     if (!resolvePlanPoint(e)) return
+    if (opts.positionAtCursor && !lastDelta) applyMove(e)
     e.preventDefault()
     e.stopPropagation()
     commitPointerId = e.pointerId
@@ -379,7 +388,19 @@ export function startGroupPickUp(
   }
 
   const onKeyDown = (e: KeyboardEvent) => {
+    if (isTypingTarget(e.target)) return
     const key = e.key.toLowerCase()
+    if ((e.metaKey || e.ctrlKey) && (key === 'c' || key === 'v' || key === 'x')) {
+      // A clipboard chord replaces the current carry. Let the global keyboard
+      // arm receive the same event after this cancellation. Capture C/X first:
+      // pasted or duplicated carries delete their transient selection while
+      // cancelling, so the global arm would otherwise see nothing.
+      if (key === 'c' || key === 'x') {
+        copySelectedNodesToEditorClipboard()
+      }
+      cancel()
+      return
+    }
     if ((key === 'r' || key === 't') && !e.metaKey && !e.ctrlKey && !e.altKey && !e.shiftKey) {
       e.preventDefault()
       e.stopPropagation()
@@ -437,21 +458,191 @@ export function duplicateSelectionAndPickUp(): boolean {
   return true
 }
 
+function sceneReferencesMaterial(materialId: string) {
+  const reference = `scene:${materialId}`
+  const containsReference = (value: unknown): boolean => {
+    if (value === reference) return true
+    if (Array.isArray(value)) return value.some(containsReference)
+    if (value && typeof value === 'object') {
+      return Object.values(value).some(containsReference)
+    }
+    return false
+  }
+  return Object.values(useScene.getState().nodes).some(containsReference)
+}
+
+function removeUnusedPasteMaterials(materialIds: SceneMaterialId[]) {
+  for (const materialId of materialIds) {
+    if (!sceneReferencesMaterial(materialId)) {
+      useScene.getState().removeSceneMaterial(materialId)
+    }
+  }
+}
+
+const REFUSED_PASTE_REASONS: Record<PasteRefusal, [one: string, many: string]> = {
+  'no-access': [
+    'you no longer have access to the project it came from.',
+    'you no longer have access to the project they came from.',
+  ],
+  'no-copies': [
+    'this version is not available to copy from the source project.',
+    'these versions are not available to copy from the source project.',
+  ],
+  failed: ["it couldn't be copied. Try again.", "they couldn't be copied. Try again."],
+}
+
+/** Why scripted objects were left out of a paste, or of a build loaded from a file. */
+export function refusedObjectsNotice(
+  count: number,
+  refusal: PasteRefusal,
+  action: 'pasted' | 'loaded' = 'pasted',
+) {
+  const [one, many] = REFUSED_PASTE_REASONS[refusal]
+  return count === 1
+    ? `1 object wasn't ${action}: ${one}`
+    : `${count} objects weren't ${action}: ${many}`
+}
+
+let pastePending = false
+
+/**
+ * Paste the Pascal scene payload from the browser clipboard onto the active
+ * level, then carry the clones under the cursor until click-to-place. Escape
+ * removes the uncommitted clones and any scene materials imported with them.
+ */
+export async function pasteSelectionAndPickUp(targetLevelId?: AnyNodeId): Promise<boolean> {
+  if (pastePending) return false
+  const activeScope = useInteractionScope.getState().scope
+  if (activeScope.kind === 'placing' || activeScope.kind === 'moving') {
+    emitter.emit('tool:cancel')
+  }
+  // Paint and sculpt hold their scope for the whole *mode*, so a pick-up would
+  // `begin({kind: 'handle-drag'})` over it — scopes are single-owner, so the brush
+  // would stay armed and painting while the editor believed a group move was
+  // running, and the mode's own release would then end someone else's scope.
+  // ⌘V is reachable from either mode (it reads the clipboard, not the selection,
+  // which is why clearing the selection on mode entry does not cover it), so drop
+  // the brush first: carrying clones is the newer intent, and unlike the cancels
+  // above there is nothing to abandon.
+  if (isBrushMode(useEditor.getState().mode)) useEditor.getState().setMode('select')
+
+  pastePending = true
+  let result: Awaited<ReturnType<typeof pasteSystemEditorClipboardToLevel>>
+  try {
+    result = await pasteSystemEditorClipboardToLevel(targetLevelId)
+  } finally {
+    pastePending = false
+  }
+  if (result?.refusal) {
+    useFloorplanMode
+      .getState()
+      .showNotice(refusedObjectsNotice(result.refusedIds.length, result.refusal))
+  }
+  if (!result || result.pastedIds.length === 0) return false
+
+  const discardPaste = () => {
+    useScene.getState().deleteNodes(result.pastedIds)
+    removeUnusedPasteMaterials(result.createdMaterialIds)
+    useViewer.getState().setSelection({ selectedIds: [] })
+  }
+  if (result.pastedIds.length === 1) {
+    const rootId = result.pastedIds[0]!
+    const root = useScene.getState().nodes[rootId]
+    if (root?.type === 'door' || root?.type === 'window') {
+      const metadata =
+        root.metadata && typeof root.metadata === 'object' && !Array.isArray(root.metadata)
+          ? (root.metadata as Record<string, unknown>)
+          : {}
+      const draft = { ...root, metadata: { ...metadata, isNew: true } }
+      useScene.getState().updateNode(rootId, { metadata: draft.metadata })
+      useViewer.getState().setSelection({ selectedIds: [] })
+      const unsubscribe = useInteractionScope.subscribe((state, previous) => {
+        const previousOwnsDraft =
+          (previous.scope.kind === 'placing' || previous.scope.kind === 'moving') &&
+          previous.scope.nodeId === rootId
+        const currentOwnsDraft =
+          (state.scope.kind === 'placing' || state.scope.kind === 'moving') &&
+          state.scope.nodeId === rootId
+        if (!previousOwnsDraft || currentOwnsDraft) return
+        unsubscribe()
+        removeUnusedPasteMaterials(result.createdMaterialIds)
+      })
+      useEditor.getState().setMovingNode(draft)
+      sfxEmitter.emit('sfx:item-pick')
+      return true
+    }
+  }
+
+  const started = startGroupPickUp({
+    positionAtCursor: true,
+    scopeToSelection: true,
+    onCancel: discardPaste,
+  })
+  if (!started) sfxEmitter.emit('sfx:item-place')
+  return true
+}
+
+/**
+ * Cut uses the same cross-tab clipboard payload as Copy, then removes exactly
+ * the copied roots. Promoted subtree selections (such as all modules in one
+ * cabinet run) therefore remove the same root that Paste will recreate.
+ */
+export function cutSelectionToEditorClipboard(): boolean {
+  if (!copySelectedNodesToEditorClipboard()) return false
+  const payload = getEditorClipboardSnapshot()
+  if (!payload || payload.rootIds.length === 0) return false
+
+  if (payload.rootIds.length === 1) {
+    emitDeleteSFX(useScene.getState().nodes[payload.rootIds[0]!]?.type)
+  } else {
+    sfxEmitter.emit('sfx:structure-delete')
+  }
+  useScene.getState().deleteNodes(payload.rootIds)
+  useViewer.getState().setSelection({ selectedIds: [] })
+  return true
+}
+
 /**
  * Delete every selected node — same semantics as the keyboard Delete arm,
  * including the accidental-bulk-delete confirm.
  */
 export function deleteSelection(): boolean {
   const selectedIds = useViewer.getState().selection.selectedIds as AnyNodeId[]
-  if (selectedIds.length === 0) return false
-  if (selectedIds.length >= BULK_DELETE_THRESHOLD) {
-    const confirmed = window.confirm(
-      `Delete ${selectedIds.length} selected elements? This cannot be undone if the undo history is exhausted.`,
-    )
-    if (!confirmed) return false
+  if (selectedIds.length === 0) {
+    const room = useEditor.getState().room
+    if (!room) return false
+    requestRoomDeletion(room.zoneId)
+    return true
   }
-  sfxEmitter.emit('sfx:structure-delete')
-  useScene.getState().deleteNodes(selectedIds)
-  useViewer.getState().setSelection({ selectedIds: [] })
+  // A drilled piece of a room (a wall, a separator, its ceiling) deleted: back to the room.
+  const origin = captureElementActionOrigin(selectedIds)
+  if (selectedIds.length === 1 && useScene.getState().nodes[selectedIds[0]!]?.type === 'separator')
+    return deleteSelectedSeparator(selectedIds[0]!, origin)
+
+  const commitDelete = () => {
+    const detail =
+      selectedIds.length === 1
+        ? (useScene.getState().nodes[selectedIds[0]!]?.type ?? selectedIds[0]!)
+        : String(selectedIds.length)
+    markPerfAction('delete', detail)
+    if (selectedIds.length === 1) {
+      emitDeleteSFX(useScene.getState().nodes[selectedIds[0]!]?.type)
+    } else {
+      sfxEmitter.emit('sfx:structure-delete')
+    }
+    useScene.getState().deleteNodes(selectedIds)
+    useViewer.getState().setSelection({ selectedIds: [] })
+    completeElementAction(origin)
+  }
+
+  if (selectedIds.length >= BULK_DELETE_THRESHOLD) {
+    useDeleteConfirmation.getState().requestConfirmation({
+      count: selectedIds.length,
+      onConfirm: commitDelete,
+    })
+    return true
+  }
+
+  commitDelete()
   return true
 }

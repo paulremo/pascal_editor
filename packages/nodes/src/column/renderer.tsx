@@ -1,7 +1,15 @@
 'use client'
 
 import {
+  type AnyNodeId,
+  COLUMN_BASE_DEFAULT,
+  COLUMN_CAPITAL_DEFAULT,
+  COLUMN_FRAME_DEFAULT,
+  COLUMN_SHAFT_DEFAULT,
   type ColumnNode,
+  type ColumnSlotId,
+  collectDescendants,
+  createSceneApi,
   useLiveNodeOverrides,
   useLiveTransforms,
   useRegistry,
@@ -17,21 +25,24 @@ import {
   createMaterial,
   createMaterialFromPresetRef,
   createSurfaceRoleMaterial,
+  NodeRenderer,
   type RenderShading,
   resolveMaterialRef,
   resolveSlotDefaultMaterial,
   useNodeEvents,
   useViewer,
 } from '@pascal-app/viewer'
-import { createContext, type ReactNode, useContext, useEffect, useMemo, useRef } from 'react'
+import { createContext, memo, type ReactNode, useContext, useEffect, useMemo, useRef } from 'react'
 import { BufferGeometry, Float32BufferAttribute, type Group, type Material } from 'three'
+import { ScriptedOpeningModel } from '../shared/scripted-opening'
 import {
-  COLUMN_BASE_DEFAULT,
-  COLUMN_CAPITAL_DEFAULT,
-  COLUMN_FRAME_DEFAULT,
-  COLUMN_SHAFT_DEFAULT,
-  type ColumnSlotId,
-} from './slots'
+  createColumnBandGeometry,
+  createColumnPanelGeometry,
+  createColumnShaftGeometry,
+  createColumnSpiralGeometry,
+} from './geometry'
+import { ColumnInspectorOverlay } from './inspector-highlight'
+import { columnCapitalBlocks, columnShaftLayout, getSegments } from './shape'
 
 type ColumnSlotMaterials = Record<ColumnSlotId, Material>
 type SceneMaterials = ReturnType<typeof useScene.getState>['materials']
@@ -82,7 +93,7 @@ function createLegacyColumnMaterial({
   return baseMaterial(shading)
 }
 
-function resolveColumnSlotMaterial({
+export function resolveColumnSlotMaterial({
   colorPreset,
   legacyMaterial,
   node,
@@ -175,60 +186,6 @@ function createColumnSlotMaterials({
   }
 }
 
-function getSegments(node: ColumnNode) {
-  if (node.crossSection === 'octagonal') return 8
-  if (node.crossSection === 'sixteen-sided') return 16
-  return 32
-}
-
-function getShaftProfile(node: ColumnNode) {
-  return node.shaftProfile ?? (node.shaftTaper > 0 ? 'tapered' : 'straight')
-}
-
-function getShaftSegmentCount(node: ColumnNode) {
-  const shaftProfile = getShaftProfile(node)
-  const shaftTaper = node.shaftTaper ?? 0
-  const hasTwist = Math.abs(node.shaftTwistStep ?? 0) > 0.001
-  return Math.max(
-    hasTwist ? 4 : 1,
-    shaftProfile === 'straight' && shaftTaper <= 0 && !hasTwist
-      ? 1
-      : (node.shaftSegmentCount ?? (hasTwist ? 12 : 24)),
-  )
-}
-
-function getShaftTwistRadians(node: ColumnNode, index: number) {
-  return ((node.shaftTwistStep ?? 0) * Math.PI * index) / 180
-}
-
-function getShaftScaleAt(node: ColumnNode, t: number) {
-  const shaftProfile = getShaftProfile(node)
-  const shaftTaper = Math.min(node.shaftTaper ?? 0, 0.85)
-  const startScale = node.shaftStartScale ?? 0.72
-  const endScale = node.shaftEndScale ?? startScale
-  const shaftBulge =
-    node.shaftBulge ??
-    (shaftProfile === 'bulged'
-      ? 0.16
-      : shaftProfile === 'baluster'
-        ? 0.2
-        : shaftProfile === 'hourglass'
-          ? 0.18
-          : 0)
-  const taperedScale = 1 - shaftTaper * t
-  const linearScale = (startScale + (endScale - startScale) * t) * taperedScale
-  const bulgeCurve = Math.sin(Math.PI * t)
-  const hourglassCurve = Math.abs(t - 0.5) * 2
-  const profileScale =
-    shaftProfile === 'bulged' || shaftProfile === 'baluster'
-      ? linearScale + shaftBulge * bulgeCurve
-      : shaftProfile === 'hourglass'
-        ? linearScale - shaftBulge * (1 - hourglassCurve)
-        : linearScale
-
-  return Math.max(0.1, profileScale)
-}
-
 type VectorTuple = [number, number, number]
 
 function clamp(value: number, min: number, max: number) {
@@ -258,6 +215,8 @@ function MappedBox({
     if (height <= 0 || width <= 0 || depth <= 0) return null
     return createColumnBoxGeometry(width, height, depth, bevelRadius)
   }, [bevelRadius, depth, height, width])
+
+  useEffect(() => () => geometry?.dispose(), [geometry])
 
   if (!geometry) return null
 
@@ -375,6 +334,8 @@ function FlatEndedBeam({
     return geometry
   }, [depth, length, start, end, width])
 
+  useEffect(() => () => geometry?.dispose(), [geometry])
+
   if (!geometry) return null
 
   return (
@@ -387,8 +348,8 @@ function FlatEndedBeam({
 
 function AFrameSupport({ node }: { node: ColumnNode }) {
   const height = Math.max(0.2, node.height)
-  const braceWidth = clamp(node.braceWidth ?? node.width, 0.04, 1.6)
-  const braceDepth = clamp(node.braceDepth ?? node.depth, 0.04, 1.6)
+  const braceWidth = Math.max(0.04, node.braceWidth ?? node.width)
+  const braceDepth = Math.max(0.04, node.braceDepth ?? node.depth)
   const bottomSpread = Math.max(0.2, node.braceBottomSpread ?? Math.max(node.width * 3, 1.2))
   const topSpread = clamp(node.braceTopSpread ?? 0.12, 0, bottomSpread)
   const bottomY = 0
@@ -435,8 +396,8 @@ function AFrameSupport({ node }: { node: ColumnNode }) {
 
 function YFrameSupport({ node }: { node: ColumnNode }) {
   const height = Math.max(0.2, node.height)
-  const braceWidth = clamp(node.braceWidth ?? node.width, 0.04, 1.6)
-  const braceDepth = clamp(node.braceDepth ?? node.depth, 0.04, 1.6)
+  const braceWidth = Math.max(0.04, node.braceWidth ?? node.width)
+  const braceDepth = Math.max(0.04, node.braceDepth ?? node.depth)
   const topSpread = Math.max(0.2, node.braceTopSpread ?? 0.9)
   const splitY = height * 0.56
   const foot: VectorTuple = [0, 0, 0]
@@ -476,8 +437,8 @@ function YFrameSupport({ node }: { node: ColumnNode }) {
 
 function VFrameSupport({ node }: { node: ColumnNode }) {
   const height = Math.max(0.2, node.height)
-  const braceWidth = clamp(node.braceWidth ?? node.width, 0.04, 1.6)
-  const braceDepth = clamp(node.braceDepth ?? node.depth, 0.04, 1.6)
+  const braceWidth = Math.max(0.04, node.braceWidth ?? node.width)
+  const braceDepth = Math.max(0.04, node.braceDepth ?? node.depth)
   const topSpread = Math.max(0.2, node.braceTopSpread ?? 1)
   const foot: VectorTuple = [0, 0, 0]
   const leftTop: VectorTuple = [-topSpread / 2, height, 0]
@@ -514,8 +475,8 @@ function VFrameSupport({ node }: { node: ColumnNode }) {
 
 function XBraceSupport({ node }: { node: ColumnNode }) {
   const height = Math.max(0.2, node.height)
-  const braceWidth = clamp(node.braceWidth ?? node.width, 0.04, 1.6)
-  const braceDepth = clamp(node.braceDepth ?? node.depth, 0.04, 1.6)
+  const braceWidth = Math.max(0.04, node.braceWidth ?? node.width)
+  const braceDepth = Math.max(0.04, node.braceDepth ?? node.depth)
   const bottomSpread = Math.max(0.2, node.braceBottomSpread ?? 1)
   const topSpread = Math.max(0.2, node.braceTopSpread ?? 1)
   const leftBottom: VectorTuple = [-bottomSpread / 2, 0, 0]
@@ -566,8 +527,8 @@ function XBraceSupport({ node }: { node: ColumnNode }) {
 
 function KBraceSupport({ node }: { node: ColumnNode }) {
   const height = Math.max(0.2, node.height)
-  const braceWidth = clamp(node.braceWidth ?? node.width, 0.04, 1.6)
-  const braceDepth = clamp(node.braceDepth ?? node.depth, 0.04, 1.6)
+  const braceWidth = Math.max(0.04, node.braceWidth ?? node.width)
+  const braceDepth = Math.max(0.04, node.braceDepth ?? node.depth)
   const spread = Math.max(0.2, Math.max(node.braceBottomSpread ?? 1, node.braceTopSpread ?? 1))
   const leftBottom: VectorTuple = [-spread / 2, 0, 0]
   const leftTop: VectorTuple = [-spread / 2, height, 0]
@@ -617,8 +578,8 @@ function KBraceSupport({ node }: { node: ColumnNode }) {
 
 function SingleStrutSupport({ node }: { node: ColumnNode }) {
   const height = Math.max(0.2, node.height)
-  const braceWidth = clamp(node.braceWidth ?? node.width, 0.04, 1.6)
-  const braceDepth = clamp(node.braceDepth ?? node.depth, 0.04, 1.6)
+  const braceWidth = Math.max(0.04, node.braceWidth ?? node.width)
+  const braceDepth = Math.max(0.04, node.braceDepth ?? node.depth)
   const spread = Math.max(0.2, Math.max(node.braceBottomSpread ?? 1, node.braceTopSpread ?? 1))
   const bottom: VectorTuple = [-spread / 2, 0, 0]
   const top: VectorTuple = [spread / 2, height, 0]
@@ -651,8 +612,8 @@ function SingleStrutSupport({ node }: { node: ColumnNode }) {
 
 function TripodSupport({ node }: { node: ColumnNode }) {
   const height = Math.max(0.2, node.height)
-  const braceWidth = clamp(node.braceWidth ?? node.width, 0.04, 1.6)
-  const braceDepth = clamp(node.braceDepth ?? node.depth, 0.04, 1.6)
+  const braceWidth = Math.max(0.04, node.braceWidth ?? node.width)
+  const braceDepth = Math.max(0.04, node.braceDepth ?? node.depth)
   const width = Math.max(0.2, node.braceBottomSpread ?? 1.1)
   const depth = Math.max(0.2, node.braceTopSpread ?? 1.1)
   const top: VectorTuple = [0, height, 0]
@@ -701,8 +662,8 @@ function TripodSupport({ node }: { node: ColumnNode }) {
 
 function TrestleSupport({ node }: { node: ColumnNode }) {
   const height = Math.max(0.2, node.height)
-  const braceWidth = clamp(node.braceWidth ?? node.width, 0.04, 1.6)
-  const braceDepth = clamp(node.braceDepth ?? node.depth, 0.04, 1.6)
+  const braceWidth = Math.max(0.04, node.braceWidth ?? node.width)
+  const braceDepth = Math.max(0.04, node.braceDepth ?? node.depth)
   const width = Math.max(0.2, node.braceBottomSpread ?? 1.2)
   const depth = Math.max(0.2, node.braceTopSpread ?? 1)
   const zPositions = [-depth / 2, depth / 2]
@@ -762,8 +723,8 @@ function TrestleSupport({ node }: { node: ColumnNode }) {
 
 function PortalFrameSupport({ node }: { node: ColumnNode }) {
   const height = Math.max(0.2, node.height)
-  const braceWidth = clamp(node.braceWidth ?? node.width, 0.04, 1.6)
-  const braceDepth = clamp(node.braceDepth ?? node.depth, 0.04, 1.6)
+  const braceWidth = Math.max(0.04, node.braceWidth ?? node.width)
+  const braceDepth = Math.max(0.04, node.braceDepth ?? node.depth)
   const width = Math.max(0.2, node.braceBottomSpread ?? 1.4)
   const leftBottom: VectorTuple = [-width / 2, 0, 0]
   const rightBottom: VectorTuple = [width / 2, 0, 0]
@@ -806,8 +767,8 @@ function PortalFrameSupport({ node }: { node: ColumnNode }) {
 
 function BoxFrameSupport({ node }: { node: ColumnNode }) {
   const height = Math.max(0.2, node.height)
-  const braceWidth = clamp(node.braceWidth ?? node.width, 0.04, 1.6)
-  const braceDepth = clamp(node.braceDepth ?? node.depth, 0.04, 1.6)
+  const braceWidth = Math.max(0.04, node.braceWidth ?? node.width)
+  const braceDepth = Math.max(0.04, node.braceDepth ?? node.depth)
   const width = Math.max(0.2, node.braceBottomSpread ?? 1.4)
   const depth = Math.max(0.2, node.braceTopSpread ?? 1)
   const corners: VectorTuple[] = [
@@ -910,6 +871,8 @@ function MappedCylinder({
     })
   }, [height, radius, radiusBottom, radiusTop, radiusX, radiusZ, segments])
 
+  useEffect(() => () => geometry?.dispose(), [geometry])
+
   if (!geometry) return null
 
   return (
@@ -955,6 +918,8 @@ function MappedCone({
     })
   }, [height, radiusX, radiusZ, segments])
 
+  useEffect(() => () => geometry?.dispose(), [geometry])
+
   if (!geometry) return null
 
   return (
@@ -988,6 +953,8 @@ function MappedSphere({
     if (radius <= 0) return null
     return createColumnSphereGeometry(radius, segments, verticalSegments)
   }, [radius, segments, verticalSegments])
+
+  useEffect(() => () => geometry?.dispose(), [geometry])
 
   if (!geometry) return null
 
@@ -1031,6 +998,8 @@ function MappedTorus({
     })
   }, [arc, ringRadius, scaleX, scaleY, scaleZ, tubeRadius])
 
+  useEffect(() => () => geometry?.dispose(), [geometry])
+
   if (!geometry) return null
 
   return (
@@ -1073,74 +1042,67 @@ function SquareBlock({
 }
 
 function RoundBlock({
-  x = 0,
   y,
-  z = 0,
   height,
   radius,
+  radiusX = 1,
+  radiusZ = 1,
   segments = 32,
+  x = 0,
+  z = 0,
 }: {
-  x?: number
   y: number
-  z?: number
   height: number
   radius: number
+  radiusX?: number
+  radiusZ?: number
   segments?: number
+  x?: number
+  z?: number
 }) {
+  const edgeSoftness = useContext(ColumnEdgeSoftnessContext)
+  const slotId = useContext(ColumnSlotContext)
+  const geometry = useMemo(() => {
+    const geometry = createColumnShaftGeometry(
+      {
+        crossSection: segments === 8 ? 'octagonal' : segments === 16 ? 'sixteen-sided' : 'round',
+        radius,
+        width: radius * 2,
+        depth: radius * 2,
+        shaftProfile: 'straight',
+        shaftTaper: 0,
+        shaftBulge: 0,
+        shaftStartScale: 1,
+        shaftEndScale: 1,
+        shaftSegmentCount: 1,
+        shaftTwistStep: 0,
+        shaftCornerRadius: 0,
+        edgeSoftness: edgeSoftness / Math.max(1, radiusX, radiusZ),
+        fluteCount: 0,
+        fluteWidth: 0.02,
+        fluteDepth: 0,
+        shaftDetail: 'none',
+      },
+      height,
+    )
+    geometry.scale(radiusX, 1, radiusZ)
+    const uv = geometry.getAttribute('uv')
+    const circumferenceRatio = Math.sqrt((radiusX ** 2 + radiusZ ** 2) / 2)
+    const positions = geometry.getAttribute('position'),
+      normals = geometry.getAttribute('normal')
+    for (let i = 0; i < uv.count; i++) {
+      if (Math.abs(normals.getY(i)) > 0.99) uv.setXY(i, positions.getX(i), positions.getZ(i))
+      else uv.setX(i, uv.getX(i) * circumferenceRatio)
+    }
+    geometry.setAttribute('uv2', uv.clone())
+    return geometry
+  }, [radius, radiusX, radiusZ, segments, height, edgeSoftness])
+  useEffect(() => () => geometry.dispose(), [geometry])
   return (
-    <MappedCylinder
-      height={height}
-      position={[x, y + height / 2, z]}
-      radius={radius}
-      segments={segments}
-    />
-  )
-}
-
-function RoundedRectangleShaftSegment({
-  y,
-  height,
-  width,
-  depth,
-  cornerRadius,
-}: {
-  y: number
-  height: number
-  width: number
-  depth: number
-  cornerRadius: number
-}) {
-  if (height <= 0) return null
-
-  const radius = Math.min(Math.max(0, cornerRadius), Math.min(width, depth) * 0.45)
-  if (radius <= 0.001) {
-    return <SquareBlock depth={depth} height={height} width={width} y={y} />
-  }
-
-  const innerWidth = Math.max(0, width - radius * 2)
-  const innerDepth = Math.max(0, depth - radius * 2)
-  const cornerX = width / 2 - radius
-  const cornerZ = depth / 2 - radius
-
-  return (
-    <group>
-      {innerWidth > 0 && (
-        <SquareBlock depth={depth} height={height} softenEdges={false} width={innerWidth} y={y} />
-      )}
-      {innerDepth > 0 && (
-        <SquareBlock depth={innerDepth} height={height} softenEdges={false} width={width} y={y} />
-      )}
-      {(
-        [
-          [cornerX, cornerZ],
-          [cornerX, -cornerZ],
-          [-cornerX, cornerZ],
-          [-cornerX, -cornerZ],
-        ] satisfies [number, number][]
-      ).map(([x, z], index) => (
-        <RoundBlock height={height} key={index} radius={radius} segments={18} x={x} y={y} z={z} />
-      ))}
-    </group>
+    <mesh castShadow receiveShadow dispose={null} position={[x, y, z]} userData={{ slotId }}>
+      <primitive attach="geometry" object={geometry} dispose={null} />
+      <ColumnMaterial />
+    </mesh>
   )
 }
 
@@ -1157,13 +1119,14 @@ function OvalBlock({
   depth: number
   segments?: number
 }) {
+  const radius = Math.min(width, depth) / 2
   return (
-    <MappedCylinder
+    <RoundBlock
+      y={y}
       height={height}
-      position={[0, y + height / 2, 0]}
-      radius={1}
-      radiusX={width / 2}
-      radiusZ={depth / 2}
+      radius={radius}
+      radiusX={width / (radius * 2)}
+      radiusZ={depth / (radius * 2)}
       segments={segments}
     />
   )
@@ -1193,52 +1156,84 @@ function ColumnBlock({
   return <RoundBlock height={height} radius={radius} segments={getSegments(node)} y={y} />
 }
 
-function TaperedRoundShaft({ node, y, height }: { node: ColumnNode; y: number; height: number }) {
-  const segmentCount = getShaftSegmentCount(node)
-  const segmentHeight = height / segmentCount
-
-  return (
-    <group>
-      {Array.from({ length: segmentCount }, (_, index) => {
-        const t = (index + 0.5) / segmentCount
-        const profileScale = getShaftScaleAt(node, t)
-        return (
-          <group key={index} rotation={[0, getShaftTwistRadians(node, index), 0]}>
-            <RoundBlock
-              height={segmentHeight * 1.015}
-              radius={node.radius * profileScale}
-              segments={getSegments(node)}
-              y={y + index * segmentHeight}
-            />
-          </group>
-        )
-      })}
-    </group>
+function MergedShaft({ node, y, height }: { node: ColumnNode; y: number; height: number }) {
+  const {
+    crossSection,
+    radius,
+    width,
+    depth,
+    shaftProfile,
+    shaftTaper,
+    shaftBulge,
+    shaftStartScale,
+    shaftEndScale,
+    shaftSegmentCount,
+    shaftTwistStep,
+    shaftCornerRadius,
+    edgeSoftness,
+    fluteCount,
+    fluteWidth,
+    fluteDepth,
+    shaftDetail,
+  } = node
+  const geometry = useMemo(
+    () =>
+      createColumnShaftGeometry(
+        {
+          crossSection,
+          radius,
+          width,
+          depth,
+          shaftProfile,
+          shaftTaper,
+          shaftBulge,
+          shaftStartScale,
+          shaftEndScale,
+          shaftSegmentCount,
+          shaftTwistStep,
+          shaftCornerRadius,
+          edgeSoftness,
+          fluteCount,
+          fluteWidth,
+          fluteDepth,
+          shaftDetail,
+        },
+        height,
+      ),
+    [
+      height,
+      crossSection,
+      radius,
+      width,
+      depth,
+      shaftProfile,
+      shaftTaper,
+      shaftBulge,
+      shaftStartScale,
+      shaftEndScale,
+      shaftSegmentCount,
+      shaftTwistStep,
+      shaftCornerRadius,
+      edgeSoftness,
+      fluteCount,
+      fluteWidth,
+      fluteDepth,
+      shaftDetail,
+    ],
   )
-}
-
-function TaperedSquareShaft({ node, y, height }: { node: ColumnNode; y: number; height: number }) {
-  const segmentCount = getShaftSegmentCount(node)
-  const segmentHeight = height / segmentCount
-
+  useEffect(() => () => geometry?.dispose(), [geometry])
+  if (!geometry) return null
   return (
-    <group>
-      {Array.from({ length: segmentCount }, (_, index) => {
-        const t = (index + 0.5) / segmentCount
-        const profileScale = getShaftScaleAt(node, t)
-        return (
-          <group key={index} rotation={[0, getShaftTwistRadians(node, index), 0]}>
-            <RoundedRectangleShaftSegment
-              cornerRadius={(node.shaftCornerRadius ?? 0.035) * profileScale}
-              depth={node.depth * profileScale}
-              height={segmentHeight * 1.015}
-              width={node.width * profileScale}
-              y={y + index * segmentHeight}
-            />
-          </group>
-        )
-      })}
-    </group>
+    <mesh
+      castShadow
+      receiveShadow
+      dispose={null}
+      position={[0, y, 0]}
+      userData={{ slotId: 'shaft' }}
+    >
+      <primitive attach="geometry" object={geometry} dispose={null} />
+      <ColumnMaterial />
+    </mesh>
   )
 }
 
@@ -1273,15 +1268,7 @@ function Shaft({ node, y, height }: { node: ColumnNode; y: number; height: numbe
     )
   }
 
-  if (
-    node.crossSection === 'round' ||
-    node.crossSection === 'octagonal' ||
-    node.crossSection === 'sixteen-sided'
-  ) {
-    return <TaperedRoundShaft height={height} node={node} y={y} />
-  }
-
-  return <TaperedSquareShaft height={height} node={node} y={y} />
+  return <MergedShaft height={height} node={node} y={y} />
 }
 
 function Base({ node, height }: { node: ColumnNode; height: number }) {
@@ -1336,7 +1323,7 @@ function Base({ node, height }: { node: ColumnNode; height: number }) {
           return (
             <SquareBlock
               depth={node.depth * depthScaleAt}
-              height={tierHeight * 1.01}
+              height={tierHeight}
               key={index}
               width={node.width * widthScaleAt}
               y={index * tierHeight}
@@ -1414,7 +1401,7 @@ function Base({ node, height }: { node: ColumnNode; height: number }) {
           )
         })}
         <RoundBlock
-          height={height * 0.16}
+          height={height * 0.18}
           radius={baseRadius * 0.72}
           segments={32}
           y={height * 0.82}
@@ -1489,7 +1476,59 @@ function BaseCarvings({ node, height }: { node: ColumnNode; height: number }) {
   )
 }
 
-function Rings({
+const detailFields = [
+  'crossSection',
+  'radius',
+  'width',
+  'depth',
+  'shaftProfile',
+  'shaftTaper',
+  'shaftBulge',
+  'shaftStartScale',
+  'shaftEndScale',
+  'shaftSegmentCount',
+  'shaftTwistStep',
+  'shaftCornerRadius',
+  'edgeSoftness',
+  'fluteCount',
+  'fluteWidth',
+  'fluteDepth',
+  'shaftDetail',
+  'spiralRibCount',
+  'spiralTwist',
+  'panelCount',
+  'style',
+  'panelShape',
+  'panelInsetDepth',
+  'ringCount',
+  'ringSpread',
+  'ringThickness',
+  'ringPlacement',
+  'latheRingCount',
+  'latheRingSpacing',
+  'lowerBandEnabled',
+  'lowerBandHeight',
+  'lowerBandCarvingLevel',
+  'carvingPlacement',
+] as const satisfies readonly (keyof ColumnNode)[]
+
+const ShaftDetails = memo(
+  function ShaftDetails(props: { node: ColumnNode; shaftHeight: number; shaftY: number }) {
+    return (
+      <>
+        <ShaftBands {...props} />
+        <DravidianShaftPanels {...props} />
+        <SpiralRibs {...props} />
+      </>
+    )
+  },
+  (a, b) =>
+    a.shaftHeight === b.shaftHeight &&
+    a.shaftY === b.shaftY &&
+    detailFields.every((key) => a.node[key] === b.node[key]),
+)
+
+function ShaftBands({
   node,
   shaftY,
   shaftHeight,
@@ -1498,202 +1537,20 @@ function Rings({
   shaftY: number
   shaftHeight: number
 }) {
-  if (node.ringCount <= 0 || shaftHeight <= 0) return null
-
-  const ringPlacement = node.ringPlacement ?? 'ends'
-  const ringSpread = Math.min(0.45, Math.max(0.04, node.ringSpread ?? 0.16))
-  const ringHeight = Math.min(
-    node.ringThickness ?? 0.055,
-    shaftHeight / Math.max(8, node.ringCount * 3),
-  )
-  const rings = Array.from({ length: node.ringCount }, (_, index) => {
-    const pairIndex = Math.floor(index / 2)
-    const nearTop = index % 2 === 1
-    const pairCount = Math.ceil(node.ringCount / 2)
-    const pairT = pairCount <= 1 ? 0 : pairIndex / (pairCount - 1)
-    const offset = Math.min(0.48, 0.06 + pairT * Math.max(0, ringSpread - 0.06))
-    const oneSideT =
-      0.06 + (index / Math.max(1, node.ringCount - 1)) * Math.max(0, ringSpread - 0.06)
-    const t =
-      ringPlacement === 'even'
-        ? (index + 1) / (node.ringCount + 1)
-        : ringPlacement === 'top'
-          ? 1 - Math.min(0.48, oneSideT)
-          : ringPlacement === 'bottom'
-            ? Math.min(0.48, oneSideT)
-            : nearTop
-              ? 1 - offset
-              : offset
-    return {
-      scale: Math.min(1.4, getShaftScaleAt(node, t) + 0.12),
-      y: shaftY + shaftHeight * t - ringHeight / 2,
-    }
-  }).sort((a, b) => a.y - b.y)
-
+  const geometry = useMemo(() => createColumnBandGeometry(node, shaftHeight), [node, shaftHeight])
+  useEffect(() => () => geometry?.dispose(), [geometry])
+  if (!geometry) return null
   return (
-    <group>
-      {rings.map((ring, index) => (
-        <ColumnBlock height={ringHeight} key={index} node={node} scale={ring.scale} y={ring.y} />
-      ))}
-    </group>
-  )
-}
-
-function LatheBands({
-  node,
-  shaftY,
-  shaftHeight,
-}: {
-  node: ColumnNode
-  shaftY: number
-  shaftHeight: number
-}) {
-  const latheRingCount = Math.max(
-    node.latheRingCount ?? 0,
-    node.shaftDetail === 'lathe-turned' ? 8 : 0,
-  )
-  if (latheRingCount <= 0 || shaftHeight <= 0) return null
-
-  const placement = node.latheRingSpacing ?? 'ends'
-  const bandHeight = Math.min(0.04, shaftHeight / Math.max(12, latheRingCount * 3))
-  const bands = Array.from({ length: latheRingCount }, (_, index) => {
-    const pairIndex = Math.floor(index / 2)
-    const nearTop = index % 2 === 1
-    const offset = Math.min(0.48, 0.1 + pairIndex * 0.04)
-    const t =
-      placement === 'even'
-        ? (index + 1) / (latheRingCount + 1)
-        : placement === 'top'
-          ? 1 - Math.min(0.48, 0.08 + index * 0.04)
-          : placement === 'bottom'
-            ? Math.min(0.48, 0.08 + index * 0.04)
-            : nearTop
-              ? 1 - offset
-              : offset
-    return shaftY + shaftHeight * t - bandHeight / 2
-  }).sort((a, b) => a - b)
-
-  return (
-    <group>
-      {bands.map((y, index) => (
-        <ColumnBlock
-          height={bandHeight}
-          key={index}
-          node={node}
-          scale={0.82 + (index % 2) * 0.08}
-          y={y}
-        />
-      ))}
-    </group>
-  )
-}
-
-function Flutes({
-  node,
-  shaftY,
-  shaftHeight,
-}: {
-  node: ColumnNode
-  shaftY: number
-  shaftHeight: number
-}) {
-  const fluteCount = Math.max(node.fluteCount, node.shaftDetail === 'fluted' ? 16 : 0)
-  if (fluteCount <= 0 || shaftHeight <= 0 || node.crossSection !== 'round') return null
-
-  const fluteDepth = node.fluteDepth ?? 0.02
-  const fluteWidth = node.fluteWidth ?? fluteDepth
-  const fluteRadius = Math.max(0.006, fluteWidth * 0.42)
-  const shaftRadius = node.radius * 0.74
-
-  return (
-    <group>
-      {Array.from({ length: fluteCount }, (_, index) => {
-        const angle = (index / fluteCount) * Math.PI * 2
-        const x = Math.cos(angle) * shaftRadius
-        const z = Math.sin(angle) * shaftRadius
-        return (
-          <MappedCylinder
-            height={shaftHeight * 0.92}
-            key={index}
-            position={[x, shaftY + shaftHeight / 2, z]}
-            radius={fluteRadius}
-            segments={8}
-          />
-        )
-      })}
-    </group>
-  )
-}
-
-function DravidianPanelFace({
-  position,
-  rotation = 0,
-  panelHeight,
-  panelWidth,
-  rail,
-  reliefDepth,
-  panelShape,
-}: {
-  position: [number, number, number]
-  rotation?: number
-  panelHeight: number
-  panelWidth: number
-  rail: number
-  reliefDepth: number
-  panelShape: NonNullable<ColumnNode['panelShape']>
-}) {
-  return (
-    <group position={position} rotation={[0, rotation, 0]}>
-      <MappedBox
-        depth={reliefDepth}
-        height={rail}
-        position={[0, panelHeight / 2, 0]}
-        softenEdges={false}
-        width={panelWidth}
-      />
-      <MappedBox
-        depth={reliefDepth}
-        height={rail}
-        position={[0, -panelHeight / 2, 0]}
-        softenEdges={false}
-        width={panelWidth}
-      />
-      <MappedBox
-        depth={reliefDepth}
-        height={panelHeight}
-        position={[panelWidth / 2, 0, 0]}
-        softenEdges={false}
-        width={rail}
-      />
-      <MappedBox
-        depth={reliefDepth}
-        height={panelHeight}
-        position={[-panelWidth / 2, 0, 0]}
-        softenEdges={false}
-        width={rail}
-      />
-      {panelShape === 'diamond' && (
-        <MappedBox
-          depth={reliefDepth}
-          height={panelHeight * 0.42}
-          position={[0, 0, 0]}
-          rotation={[0, 0, Math.PI / 4]}
-          softenEdges={false}
-          width={rail * 1.2}
-        />
-      )}
-      {panelShape === 'arched' && (
-        <MappedTorus
-          arc={Math.PI}
-          position={[0, panelHeight * 0.28, 0]}
-          ringRadius={panelWidth * 0.42}
-          scaleX={panelWidth * 0.42}
-          scaleY={rail}
-          scaleZ={reliefDepth}
-          tubeRadius={Math.max(rail, reliefDepth) * 0.18}
-        />
-      )}
-    </group>
+    <mesh
+      castShadow
+      receiveShadow
+      dispose={null}
+      position={[0, shaftY, 0]}
+      userData={{ slotId: 'shaft' }}
+    >
+      <primitive attach="geometry" object={geometry} dispose={null} />
+      <ColumnMaterial />
+    </mesh>
   )
 }
 
@@ -1706,51 +1563,20 @@ function DravidianShaftPanels({
   shaftY: number
   shaftHeight: number
 }) {
-  const panelCount = Math.max(
-    node.panelCount ?? 0,
-    node.style === 'dravidian-carved' || node.shaftDetail === 'panelled' ? 3 : 0,
-  )
-  if (panelCount <= 0 || shaftHeight <= 0) return null
-
-  const shaftWidth = node.width * 0.72
-  const shaftDepth = node.depth * 0.72
-  const panelHeight = Math.min(0.42, shaftHeight / Math.max(4, panelCount + 2))
-  const panelWidth = node.width * 0.26
-  const rail = Math.max(0.012, node.width * 0.028)
-  const reliefDepth = Math.max(0.012, node.panelInsetDepth ?? node.width * 0.025)
-  const rows = Array.from({ length: panelCount }, (_, index) => (index + 1) / (panelCount + 1))
-  const panelShape = node.panelShape ?? 'rectangle'
-
-  const faceProps = { panelHeight, panelWidth, rail, reliefDepth, panelShape }
-
+  const geometry = useMemo(() => createColumnPanelGeometry(node, shaftHeight), [node, shaftHeight])
+  useEffect(() => () => geometry?.dispose(), [geometry])
+  if (!geometry) return null
   return (
-    <group>
-      {rows.map((t, rowIndex) => {
-        const y = shaftY + shaftHeight * t
-        return (
-          <group key={rowIndex}>
-            <DravidianPanelFace
-              position={[0, y, shaftDepth / 2 + reliefDepth / 2]}
-              {...faceProps}
-            />
-            <DravidianPanelFace
-              position={[0, y, -shaftDepth / 2 - reliefDepth / 2]}
-              {...faceProps}
-            />
-            <DravidianPanelFace
-              position={[shaftWidth / 2 + reliefDepth / 2, y, 0]}
-              rotation={Math.PI / 2}
-              {...faceProps}
-            />
-            <DravidianPanelFace
-              position={[-shaftWidth / 2 - reliefDepth / 2, y, 0]}
-              rotation={Math.PI / 2}
-              {...faceProps}
-            />
-          </group>
-        )
-      })}
-    </group>
+    <mesh
+      castShadow
+      receiveShadow
+      dispose={null}
+      position={[0, shaftY, 0]}
+      userData={{ slotId: 'shaft' }}
+    >
+      <primitive attach="geometry" object={geometry} dispose={null} />
+      <ColumnMaterial />
+    </mesh>
   )
 }
 
@@ -1763,91 +1589,20 @@ function SpiralRibs({
   shaftY: number
   shaftHeight: number
 }) {
-  const spiralRibCount = node.spiralRibCount ?? 0
-  const spiralTwist = node.spiralTwist ?? 0
-  const shaftTaper = node.shaftTaper ?? 0
-  const ribCountSetting = Math.max(spiralRibCount, node.shaftDetail === 'spiral' ? 12 : 0)
-  if (ribCountSetting <= 0 || spiralTwist === 0 || shaftHeight <= 0) return null
-
-  const ribCount = Math.min(ribCountSetting, 24)
-  const stepCount = 28
-  const ribDistance = node.radius * 0.78
-  const ribWidth = Math.max(0.012, node.radius * 0.06)
-  const segmentHeight = (shaftHeight / stepCount) * 1.18
-  const lean = spiralTwist > 0 ? -0.55 : 0.55
-
+  const geometry = useMemo(() => createColumnSpiralGeometry(node, shaftHeight), [node, shaftHeight])
+  useEffect(() => () => geometry?.dispose(), [geometry])
+  if (!geometry) return null
   return (
-    <group>
-      {Array.from({ length: ribCount * stepCount }, (_, index) => {
-        const ribIndex = index % ribCount
-        const stepIndex = Math.floor(index / ribCount)
-        const t = (stepIndex + 0.5) / stepCount
-        const angle = (ribIndex / ribCount) * Math.PI * 2 + t * spiralTwist * Math.PI * 2
-        const taperScale = 1 - Math.min(shaftTaper, 0.85) * t
-        return (
-          <MappedCylinder
-            height={segmentHeight}
-            key={index}
-            position={[
-              Math.cos(angle) * ribDistance * taperScale,
-              shaftY + shaftHeight * t,
-              Math.sin(angle) * ribDistance * taperScale,
-            ]}
-            radius={ribWidth}
-            rotation={[0, -angle, lean]}
-            segments={8}
-          />
-        )
-      })}
-    </group>
-  )
-}
-
-function LowerCarvedBand({
-  node,
-  shaftY,
-  shaftHeight,
-}: {
-  node: ColumnNode
-  shaftY: number
-  shaftHeight: number
-}) {
-  const placement = node.carvingPlacement ?? 'capital'
-  if (
-    !node.lowerBandEnabled ||
-    shaftHeight <= 0 ||
-    (placement !== 'shaft' && placement !== 'all')
-  ) {
-    return null
-  }
-
-  const bandHeight = Math.min(node.lowerBandHeight ?? 0.24, shaftHeight * 0.35)
-  const y = shaftY + shaftHeight * 0.12
-  const level = Math.max(1, node.lowerBandCarvingLevel ?? 1)
-  const count = Math.max(6, level * 6)
-  const distance = Math.max(node.radius * 0.82, Math.max(node.width, node.depth) * 0.36)
-
-  return (
-    <group>
-      <ColumnBlock height={bandHeight} node={node} scale={0.84} y={y} />
-      {Array.from({ length: count }, (_, index) => {
-        const angle = (index / count) * Math.PI * 2
-        return (
-          <MappedCylinder
-            height={bandHeight * 0.62}
-            key={index}
-            position={[
-              Math.cos(angle) * distance,
-              y + bandHeight * 0.5,
-              Math.sin(angle) * distance,
-            ]}
-            radius={0.012}
-            rotation={[0, -angle, 0]}
-            segments={5}
-          />
-        )
-      })}
-    </group>
+    <mesh
+      castShadow
+      receiveShadow
+      dispose={null}
+      position={[0, shaftY, 0]}
+      userData={{ slotId: 'shaft' }}
+    >
+      <primitive attach="geometry" object={geometry} dispose={null} />
+      <ColumnMaterial />
+    </mesh>
   )
 }
 
@@ -2087,38 +1842,53 @@ function LeafCarvings({
 }
 
 function Capital({ node, y, height }: { node: ColumnNode; y: number; height: number }) {
-  if (height <= 0) return null
-
-  const capitalStyle = node.capitalStyle ?? 'simple'
-  if (capitalStyle === 'none') return null
-
-  if (capitalStyle === 'south-indian-bracket' || capitalStyle === 'wood-bracket') {
-    const tierCount = Math.max(1, node.bracketTierCount ?? 3)
-    const tierHeight = height / tierCount
-    const bracketDepth = node.bracketDepth ?? 0.35
-    return (
-      <group>
-        {Array.from({ length: tierCount }, (_, index) => {
-          const t = index / Math.max(1, tierCount - 1)
-          const scale = (node.capitalWidthScale ?? 1.6) + t * 0.32
-          return (
-            <SquareBlock
-              depth={node.depth * scale + bracketDepth * t}
-              height={tierHeight}
-              key={index}
-              width={node.width * scale + bracketDepth * t}
-              y={y + index * tierHeight}
-            />
-          )
-        })}
-        {Array.from({ length: node.pendantCount ?? 0 }, (_, index) => {
-          const count = Math.max(1, node.pendantCount ?? 0)
-          const angle = (index / count) * Math.PI * 2
+  const blocks = columnCapitalBlocks(node, y, height)
+  if (!blocks.length) return null
+  return (
+    <group>
+      {blocks.map((block, index) =>
+        block.kind === 'box' ? (
+          <SquareBlock
+            key={index}
+            y={block.y}
+            height={block.height}
+            width={block.width!}
+            depth={block.depth!}
+          />
+        ) : block.kind === 'oval' ? (
+          <OvalBlock
+            key={index}
+            y={block.y}
+            height={block.height}
+            width={block.width!}
+            depth={block.depth!}
+          />
+        ) : block.kind === 'round' ? (
+          <RoundBlock
+            key={index}
+            y={block.y}
+            height={block.height}
+            radius={block.radius!}
+            segments={getSegments(node)}
+          />
+        ) : (
+          <ColumnBlock
+            key={index}
+            node={node}
+            y={block.y}
+            height={block.height}
+            scale={block.scale}
+          />
+        ),
+      )}
+      {(node.capitalStyle === 'south-indian-bracket' || node.capitalStyle === 'wood-bracket') &&
+        Array.from({ length: node.pendantCount ?? 0 }, (_, index) => {
+          const angle = (index / Math.max(1, node.pendantCount ?? 0)) * Math.PI * 2
           const distance = Math.max(node.width, node.depth) * 0.56
           return (
             <MappedCone
-              height={height * 0.28}
               key={index}
+              height={height * 0.28}
               position={[Math.cos(angle) * distance, y - height * 0.1, Math.sin(angle) * distance]}
               radiusX={0.035}
               rotation={[0, 0, 0]}
@@ -2126,112 +1896,9 @@ function Capital({ node, y, height }: { node: ColumnNode; y: number; height: num
             />
           )
         })}
-      </group>
-    )
-  }
-
-  if (capitalStyle === 'rounded' || capitalStyle === 'doric') {
-    const topWidth = node.width * (node.capitalWidthScale ?? 1.34)
-    const topDepth = node.depth * (node.capitalDepthScale ?? node.capitalWidthScale ?? 1.34)
-    return (
-      <group>
-        <OvalBlock
-          depth={topDepth * 0.72}
-          height={height * 0.24}
-          segments={32}
-          width={topWidth * 0.72}
-          y={y}
-        />
-        <OvalBlock
-          depth={topDepth * 0.92}
-          height={height * 0.32}
-          segments={32}
-          width={topWidth * 0.92}
-          y={y + height * 0.24}
-        />
-        <SquareBlock
-          depth={topDepth}
-          height={height * 0.44}
-          width={topWidth}
-          y={y + height * 0.56}
-        />
-      </group>
-    )
-  }
-
-  if (capitalStyle === 'stepped') {
-    const widthScale = node.capitalWidthScale ?? 1.46
-    const depthScale = node.capitalDepthScale ?? widthScale
-    const tierCount = Math.max(3, node.capitalTierCount ?? 3)
-    const tierHeight = height / tierCount
-    const stepSpread = node.capitalStepSpread ?? 0.42
-
-    return (
-      <group>
-        {Array.from({ length: tierCount }, (_, index) => {
-          const t = index / Math.max(1, tierCount - 1)
-          const widthScaleAt = Math.max(0.5, widthScale - (1 - t) * stepSpread)
-          const depthScaleAt = Math.max(0.5, depthScale - (1 - t) * stepSpread)
-          return (
-            <SquareBlock
-              depth={node.depth * depthScaleAt}
-              height={tierHeight * 1.01}
-              key={index}
-              width={node.width * widthScaleAt}
-              y={y + index * tierHeight}
-            />
-          )
-        })}
-      </group>
-    )
-  }
-
-  if (
-    capitalStyle === 'volute' ||
-    capitalStyle === 'ionic-volute' ||
-    capitalStyle === 'leaf-carved' ||
-    capitalStyle === 'corinthian-leaf'
-  ) {
-    const topWidth = node.width * (node.capitalWidthScale ?? 1.46)
-    const topDepth = node.depth * (node.capitalDepthScale ?? node.capitalWidthScale ?? 1.46)
-
-    return (
-      <group>
-        <ColumnBlock height={height * 0.24} node={node} scale={0.9} y={y} />
-        <ColumnBlock height={height * 0.2} node={node} scale={1.08} y={y + height * 0.24} />
-        <SquareBlock
-          depth={topDepth}
-          height={height * 0.28}
-          width={topWidth}
-          y={y + height * 0.44}
-        />
-        <Volutes capitalHeight={height} capitalY={y} node={node} />
-        <LeafCarvings capitalHeight={height} capitalY={y} node={node} />
-      </group>
-    )
-  }
-
-  const widthScale = node.capitalWidthScale ?? (capitalStyle === 'simple-slab' ? 1.28 : 1.18)
-  const depthScale = node.capitalDepthScale ?? widthScale
-
-  if (node.crossSection === 'square' || node.crossSection === 'rectangular') {
-    return (
-      <SquareBlock
-        depth={node.depth * depthScale}
-        height={height}
-        width={node.width * widthScale}
-        y={y}
-      />
-    )
-  }
-
-  return (
-    <RoundBlock
-      height={height}
-      radius={Math.max(node.radius * widthScale, node.width * widthScale * 0.5)}
-      segments={getSegments(node)}
-      y={y}
-    />
+      <Volutes capitalHeight={height} capitalY={y} node={node} />
+      <LeafCarvings capitalHeight={height} capitalY={y} node={node} />
+    </group>
   )
 }
 
@@ -2245,13 +1912,7 @@ function Capital({ node, y, height }: { node: ColumnNode; y: number; height: num
  * wrapping this in its own providers.
  */
 function ColumnBody({ node }: { node: ColumnNode }) {
-  const shaftLayout = useMemo(() => {
-    const baseHeight = node.baseStyle === 'none' ? 0 : Math.min(node.baseHeight, node.height * 0.4)
-    const capitalHeight =
-      node.capitalStyle === 'none' ? 0 : Math.min(node.capitalHeight, node.height * 0.4)
-    const shaftHeight = Math.max(0.1, node.height - baseHeight - capitalHeight)
-    return { baseHeight, capitalHeight, shaftY: baseHeight, shaftHeight }
-  }, [node.baseHeight, node.baseStyle, node.capitalHeight, node.capitalStyle, node.height])
+  const shaftLayout = columnShaftLayout(node)
 
   if (node.supportStyle !== 'vertical') {
     const support =
@@ -2287,20 +1948,11 @@ function ColumnBody({ node }: { node: ColumnNode }) {
       </ColumnSlot>
       <ColumnSlot slotId="shaft">
         <Shaft height={shaftLayout.shaftHeight} node={node} y={shaftLayout.shaftY} />
-        <Rings node={node} shaftHeight={shaftLayout.shaftHeight} shaftY={shaftLayout.shaftY} />
-        <LatheBands node={node} shaftHeight={shaftLayout.shaftHeight} shaftY={shaftLayout.shaftY} />
-        <Flutes node={node} shaftHeight={shaftLayout.shaftHeight} shaftY={shaftLayout.shaftY} />
-        <LowerCarvedBand
+        <ShaftDetails
           node={node}
           shaftHeight={shaftLayout.shaftHeight}
           shaftY={shaftLayout.shaftY}
         />
-        <DravidianShaftPanels
-          node={node}
-          shaftHeight={shaftLayout.shaftHeight}
-          shaftY={shaftLayout.shaftY}
-        />
-        <SpiralRibs node={node} shaftHeight={shaftLayout.shaftHeight} shaftY={shaftLayout.shaftY} />
       </ColumnSlot>
       <ColumnSlot slotId="capital">
         <Capital
@@ -2369,7 +2021,7 @@ export const ColumnPreview = ({ node }: { node: ColumnNode }) => {
     <ColumnMaterialContext.Provider value={materials}>
       <ColumnEdgeSoftnessContext.Provider value={node.edgeSoftness ?? 0.025}>
         <group ref={groupRef}>
-          <ColumnBody node={node} />
+          {node.source ? <ScriptedOpeningModel node={node} /> : <ColumnBody node={node} />}
         </group>
       </ColumnEdgeSoftnessContext.Provider>
     </ColumnMaterialContext.Provider>
@@ -2378,6 +2030,7 @@ export const ColumnPreview = ({ node }: { node: ColumnNode }) => {
 
 export const ColumnRenderer = ({ node: rawNode }: { node: ColumnNode }) => {
   const ref = useRef<Group>(null!)
+  const bodyRef = useRef<Group>(null)
   // Merge any live drag override so width / depth / radius / height
   // arrows update the mesh on every pointer move, with zustand only
   // hearing the commit on release. Subscribes narrowly to this node's
@@ -2387,6 +2040,8 @@ export const ColumnRenderer = ({ node: rawNode }: { node: ColumnNode }) => {
     () => (liveOverride ? ({ ...rawNode, ...liveOverride } as ColumnNode) : rawNode),
     [rawNode, liveOverride],
   )
+  const scriptedColumn = Boolean(node.source)
+  const modelData = useMemo(() => ({ scriptedColumn }), [scriptedColumn])
   const handlers = useNodeEvents(node, 'column')
   const liveTransform = useLiveTransforms((state) => state.get(node.id))
   const shading = useViewer((state) => state.shading)
@@ -2408,6 +2063,19 @@ export const ColumnRenderer = ({ node: rawNode }: { node: ColumnNode }) => {
   )
 
   useRegistry(node.id, node.type, ref)
+  // This renderer bypasses GeometrySystem, which normally invalidates hosted descendants.
+  useEffect(() => {
+    const dirtySubtree = () => {
+      const scene = createSceneApi(useScene)
+      for (const id of collectDescendants(node.id, { scene })) {
+        scene.markDirty(id)
+      }
+    }
+    dirtySubtree()
+    return useLiveTransforms.subscribe((state, previous) => {
+      if (state.transforms.get(node.id) !== previous.transforms.get(node.id)) dirtySubtree()
+    })
+  }, [node])
 
   return (
     <ColumnMaterialContext.Provider value={materials}>
@@ -2417,10 +2085,27 @@ export const ColumnRenderer = ({ node: rawNode }: { node: ColumnNode }) => {
           ref={ref}
           rotation={[0, liveTransform?.rotation ?? node.rotation, 0]}
           visible={node.visible}
+          userData={modelData}
           {...handlers}
         >
-          <ColumnBody node={node} />
+          <group ref={bodyRef} name="column-body">
+            {node.source ? (
+              <ScriptedOpeningModel host={ref} node={node} />
+            ) : (
+              <ColumnBody node={node} />
+            )}
+          </group>
+          {node.children.map((id) => (
+            <NodeRenderer key={id} nodeId={id as AnyNodeId} />
+          ))}
         </group>
+        <ColumnInspectorOverlay
+          nodeId={node.id}
+          body={bodyRef}
+          node={node}
+          position={liveTransform?.position ?? node.position}
+          rotation={liveTransform?.rotation ?? node.rotation}
+        />
       </ColumnEdgeSoftnessContext.Provider>
     </ColumnMaterialContext.Provider>
   )

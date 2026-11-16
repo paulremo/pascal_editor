@@ -1,13 +1,15 @@
-#!/usr/bin/env bun
+#!/usr/bin/env node
 // Load shims FIRST so any subsequent core import sees the RAF polyfill.
 import '../bridge/node-shims'
 
 import { readFileSync } from 'node:fs'
 import { parseArgs } from 'node:util'
+import { sdfChecksFromEnv, setSdfChecks } from '@pascal-app/core/usage-field'
 import { SceneBridge } from '../bridge/scene-bridge'
 import { version } from '../index'
 import { createPascalMcpServer } from '../server'
-import { createSceneStore } from '../storage'
+import { createSceneStore, resolveDefaultDatabasePath } from '../storage'
+import { localGeometryScripts } from '../tools/local-geometry-scripts'
 import { connectHttp } from '../transports/http'
 import { connectStdio } from '../transports/stdio'
 
@@ -53,26 +55,37 @@ async function main(): Promise<void> {
     process.exit(0)
   }
 
-  const bridge = new SceneBridge()
-  if (values.scene) {
-    const raw = readFileSync(values.scene, 'utf8')
-    bridge.loadJSON(raw)
-  } else {
-    bridge.loadDefault()
-  }
-
+  setSdfChecks(sdfChecksFromEnv(process.env.PASCAL_SDF_CHECKS))
   const store = await createSceneStore()
-  const server = createPascalMcpServer({ bridge, store })
+  const createServer = () => {
+    const bridge = new SceneBridge()
+    if (values.scene) bridge.loadJSON(readFileSync(values.scene, 'utf8'))
+    else bridge.loadDefault()
+    bridge.clearHistory()
+    return createPascalMcpServer({
+      bridge,
+      store,
+      geometryScripts: localGeometryScripts(resolveDefaultDatabasePath()),
+    })
+  }
 
   if (values.http) {
     const portNum = Number.parseInt(values.port ?? '3917', 10)
     if (!Number.isFinite(portNum) || portNum < 0 || portNum > 65_535) {
       throw new Error(`invalid --port value: ${values.port}`)
     }
-    const handle = await connectHttp(server, portNum, {
+    const handle = await connectHttp(createServer, portNum, {
       host: values.host,
       authToken: values['auth-token'],
       allowedOrigins: values['cors-origin'],
+      ...(process.env.PASCAL_INSTANCE_ID
+        ? {
+            health: {
+              version: process.env.PASCAL_RUNTIME_VERSION ?? version,
+              instanceId: process.env.PASCAL_INSTANCE_ID,
+            },
+          }
+        : {}),
     })
     console.error(`[pascal-mcp] HTTP server listening on ${handle.host}:${handle.port}`)
     const shutdown = async () => {
@@ -86,7 +99,7 @@ async function main(): Promise<void> {
     process.on('SIGTERM', shutdown)
   } else {
     // --stdio is the default when no transport flag is passed.
-    await connectStdio(server)
+    connectStdio(createServer)
     console.error('[pascal-mcp] stdio server running')
   }
 }

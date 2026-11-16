@@ -1,9 +1,13 @@
 import {
   type AnyNodeId,
+  cascadeDirty,
+  createSceneApi,
   type FloorplanAffordance,
   type ShelfNode,
+  useLiveNodeOverrides,
   useScene,
 } from '@pascal-app/core'
+import { isAngleSnapActive } from '@pascal-app/editor'
 import { rotateAffordanceDelta } from '../shared/rotate-affordance'
 
 // Mirror the 3D handles in `shelf/definition.ts` so a drag can't push a
@@ -45,13 +49,16 @@ export const shelfResizeAffordance: FloorplanAffordance<ShelfNode> = {
         } else {
           lastPatch = { depth: Math.max(MIN_SHELF_DEPTH, initialDepth + 2 * projDelta) }
         }
-        useScene.getState().updateNode(shelfId, lastPatch)
+        useLiveNodeOverrides.getState().set(shelfId, lastPatch)
+        for (const id of cascadeDirty(shelfId, { scene: createSceneApi(useScene) }))
+          useScene.getState().markDirty(id)
       },
       canCommit() {
         return true
       },
       commit() {
         if (Object.keys(lastPatch).length > 0) {
+          useLiveNodeOverrides.getState().clear(shelfId)
           useScene.getState().updateNode(shelfId, lastPatch)
         }
       },
@@ -83,21 +90,24 @@ export const shelfRotateAffordance: FloorplanAffordance<ShelfNode> = {
 
     return {
       affectedIds: [shelfId],
-      apply({ planPoint, modifiers }) {
+      apply({ planPoint }) {
         const delta = rotateAffordanceDelta({
           center: [cx, cz],
           initialAngle,
           planPoint,
-          free: modifiers.shiftKey,
+          free: !isAngleSnapActive(),
         })
         const newRotationY = initialRotationY - delta
         lastRotation = [r[0], newRotationY, r[2]]
-        useScene.getState().updateNode(shelfId, { rotation: lastRotation })
+        useLiveNodeOverrides.getState().set(shelfId, { rotation: lastRotation })
+        for (const id of cascadeDirty(shelfId, { scene: createSceneApi(useScene) }))
+          useScene.getState().markDirty(id)
       },
       canCommit() {
         return true
       },
       commit() {
+        useLiveNodeOverrides.getState().clear(shelfId)
         useScene.getState().updateNode(shelfId, { rotation: lastRotation })
       },
     }

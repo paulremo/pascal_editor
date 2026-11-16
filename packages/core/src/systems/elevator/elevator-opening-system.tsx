@@ -1,58 +1,51 @@
 'use client'
 
-import { useEffect, useRef } from 'react'
-import type { AnyNode } from '../../schema'
+import { useEffect } from 'react'
+import { structureChangeBatch } from '../../commands/structure/shared'
+import { isSettlingDocument } from '../../store/document-settling'
+import { pauseSceneHistory, resumeSceneHistory } from '../../store/history-control'
+import { isHydrationNormalization } from '../../store/scene-hydration'
 import useScene from '../../store/use-scene'
-import { syncAutoElevatorOpenings } from './elevator-opening-sync'
+import { changedInputs, isElevatorOpeningInput } from '../document-reconcile'
+import { planOwnedFloorOpenings } from '../owned-floor-openings'
+import { reconcileOwnedFloorOpeningChanges } from '../reconcile-owned-floor-openings'
 
-function isOpeningRelevantNode(node: AnyNode | undefined) {
-  return (
-    node?.type === 'building' ||
-    node?.type === 'ceiling' ||
-    node?.type === 'elevator' ||
-    node?.type === 'level' ||
-    node?.type === 'slab'
-  )
-}
+export function initializeElevatorOpeningSync() {
+  let syncingAutoOpenings = false
 
-function hasOpeningRelevantNodeChange(
-  nextNodes: Record<string, AnyNode>,
-  prevNodes: Record<string, AnyNode>,
-) {
-  if (nextNodes === prevNodes) return false
-
-  const ids = new Set([...Object.keys(nextNodes), ...Object.keys(prevNodes)])
-  for (const id of ids) {
-    const nextNode = nextNodes[id]
-    const prevNode = prevNodes[id]
-    if (nextNode === prevNode) continue
-    if (isOpeningRelevantNode(nextNode) || isOpeningRelevantNode(prevNode)) return true
+  const applyChanges = (skipExistingSurfaces = false) => {
+    const changes = planOwnedFloorOpenings(useScene.getState().nodes, { skipExistingSurfaces })
+    if (changes.length === 0) return
+    syncingAutoOpenings = true
+    pauseSceneHistory(useScene)
+    try {
+      const before = useScene.getState().nodes
+      useScene.getState().applyNodeChanges(structureChangeBatch(changes))
+      reconcileOwnedFloorOpeningChanges(useScene, before, changes)
+    } finally {
+      resumeSceneHistory(useScene)
+      syncingAutoOpenings = false
+    }
   }
 
-  return false
+  applyChanges(true)
+
+  return useScene.subscribe((state, prevState) => {
+    if (syncingAutoOpenings || isSettlingDocument(useScene)) return
+    // A level's child list is bookkeeping (furniture re-parenting under it): what joined or left
+    // is an input of its own, as the document reconcile reads it.
+    if (
+      !changedInputs(prevState.nodes, state.nodes, isElevatorOpeningInput, {
+        ignoreChildLists: true,
+      })
+    )
+      return
+    applyChanges(isHydrationNormalization() || state.hydrationId !== prevState.hydrationId)
+  })
 }
 
 export const ElevatorOpeningSystem = () => {
-  const syncingAutoOpeningsRef = useRef(false)
-
-  useEffect(() => {
-    const applyUpdates = (updates: ReturnType<typeof syncAutoElevatorOpenings>) => {
-      if (updates.length === 0) return
-      syncingAutoOpeningsRef.current = true
-      useScene.getState().updateNodes(updates)
-      queueMicrotask(() => {
-        syncingAutoOpeningsRef.current = false
-      })
-    }
-
-    applyUpdates(syncAutoElevatorOpenings(useScene.getState().nodes))
-
-    return useScene.subscribe((state, prevState) => {
-      if (syncingAutoOpeningsRef.current) return
-      if (!hasOpeningRelevantNodeChange(state.nodes, prevState.nodes)) return
-      applyUpdates(syncAutoElevatorOpenings(state.nodes))
-    })
-  }, [])
+  useEffect(() => initializeElevatorOpeningSync(), [])
 
   return null
 }

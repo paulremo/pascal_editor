@@ -6,11 +6,18 @@ import {
   type FloorplanGeometry,
   type FloorplanPoint,
   type GeometryContext,
+  getDoorOpeningSize,
+  getWallFaceOffsets,
   isCurvedWall,
   type OpeningSpan,
+  openingHostFacing,
+  readFloorplanContext,
+  useScene,
   type WallNode,
   type WindowNode,
 } from '@pascal-app/core'
+import { formatConstructionLength } from './construction-length'
+import { resolveWallOpeningCeiling } from './wall-opening-ceiling'
 
 /**
  * Build placement-measurement dimension lines for a door / window
@@ -52,8 +59,9 @@ export function buildOpeningPlacementDimensions(
   // walls) via ctx.resolve to compute the centroid.
   const outwardNormal = computeOutwardNormal(wall, ctx, dirX, dirZ)
 
-  const wallThickness = wall.thickness ?? 0.1
-  const halfThickness = wallThickness / 2
+  const offsets = getWallFaceOffsets(wall)
+  const halfThickness =
+    outwardNormal[0] * -dirZ + outwardNormal[1] * dirX >= 0 ? offsets.a : -offsets.b
   const FLOORPLAN_WALL_OUTER_MEASUREMENT_OFFSET = 0.32
 
   // Outer-face projection for the placement dimensions (so extension lines stay
@@ -64,7 +72,8 @@ export function buildOpeningPlacementDimensions(
     z1 + dirZ * along + outwardNormal[1] * halfThickness,
   ]
   const centrePoint = (along: number): FloorplanPoint => [x1 + dirX * along, z1 + dirZ * along]
-  const round = (value: number) => Number.parseFloat(value.toFixed(2))
+  const unit = ctx.viewState?.unit ?? 'metric'
+  const metricNotation = readFloorplanContext(ctx).metricNotation
 
   // This wall's OTHER openings as wall-local spans. `ctx.siblings` only includes
   // same-kind nodes; doors and windows need each other, so resolve the wall's
@@ -76,25 +85,34 @@ export function buildOpeningPlacementDimensions(
     const sibling = ctx.resolve(childId) as AnyNode | undefined
     if (!sibling || (sibling.type !== 'door' && sibling.type !== 'window')) continue
     const sib = sibling as DoorNode | WindowNode
+    const size = getDoorOpeningSize(sib)
     siblings.push({
       id: sib.id,
-      centerS: sib.position[0],
-      width: sib.width,
-      centerY: sib.position[1],
-      height: sib.height,
+      centerS: sib.position[0] - size.leafOffsetX * openingHostFacing(sib),
+      width: size.width,
+      centerY: sib.position[1] + (size.height - sib.height) / 2,
+      height: size.height,
     })
   }
 
+  const size = getDoorOpeningSize(opening)
   const guides = computeOpeningGuides({
     moving: {
       id: opening.id,
-      centerS: opening.position[0],
-      width: opening.width,
-      centerY: opening.position[1],
-      height: opening.height,
+      centerS: opening.position[0] - size.leafOffsetX * openingHostFacing(opening),
+      width: size.width,
+      centerY: opening.position[1] + (size.height - opening.height) / 2,
+      height: size.height,
     },
     siblings,
-    wall: { length: wallLength, height: wall.height ?? 2.5 },
+    wall: {
+      length: wallLength,
+      height: resolveWallOpeningCeiling(
+        wall,
+        useScene.getState().nodes,
+        wallLength > 1e-4 ? Math.max(0, Math.min(1, opening.position[0] / wallLength)) : 0.5,
+      ),
+    },
     // The 2D plan is top-down: sill/head height and vertical alignment aren't
     // representable here — those belong to the 3D viewport.
     includeVertical: false,
@@ -113,7 +131,7 @@ export function buildOpeningPlacementDimensions(
       offsetNormal: outwardNormal,
       offsetDistance: FLOORPLAN_WALL_OUTER_MEASUREMENT_OFFSET,
       extensionOvershoot: 0.12,
-      text: `${round(gap.distance)}m`,
+      text: formatConstructionLength(gap.distance, unit, 'editor', { metricNotation }),
       stroke: '#f97316',
     })
   }
@@ -121,7 +139,9 @@ export function buildOpeningPlacementDimensions(
   // Equal-spacing rhythm — a "=" badge per equal gap, on the wall centreline.
   if (guides.equalSpacing) {
     const wallAngle = Math.atan2(dz, dx)
-    const text = `${round(guides.equalSpacing.gap)}m`
+    const text = formatConstructionLength(guides.equalSpacing.gap, unit, 'editor', {
+      metricNotation,
+    })
     for (const seg of guides.equalSpacing.segments) {
       out.push({
         kind: 'equal-spacing-badge',

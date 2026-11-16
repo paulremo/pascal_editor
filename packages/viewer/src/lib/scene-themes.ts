@@ -1,4 +1,4 @@
-import type { SurfaceRole } from '@pascal-app/core'
+import type { SitePresentation, SurfaceRole } from '@pascal-app/core'
 
 export type SceneTheme = {
   id: string
@@ -8,20 +8,33 @@ export type SceneTheme = {
   // the site ground fill. The 3D background + lights come from the fields below.
   appearance: 'light' | 'dark'
   background: string
-  // Colour of the site ground fill + infinite ground-occluder plane. Kept
+  // Optional zenith colour for the backdrop: the post pipeline renders a
+  // vertical screen-space gradient from this (top) to `background` (horizon).
+  // Null → flat background; omitted keeps the derived horizon/zenith colours.
+  backgroundSky?: string | null
+  // Colour of the site ground fill. Kept
   // separate from `background` so dark themes can have a lit ground that reads
   // as ground rather than going near-black.
   ground: string
   ambient: { color: string; intensity: number }
   hemi?: { sky: string; ground: string; intensity: number }
-  lights: Array<{
-    position: [number, number, number]
-    color: string
-    intensity: number
-    castShadow?: boolean
-  }>
+  lights: NonNullable<NonNullable<SitePresentation['lighting']>['lights']>
   toneMappingExposure: number
+  environment?: NonNullable<SitePresentation['lighting']>['environment']
+  postprocessing?: SitePresentation['postprocessing']
   clayTints?: Partial<Record<SurfaceRole, string>>
+}
+
+export function projectSceneTheme(theme: SceneTheme, presentation?: SitePresentation): SceneTheme {
+  if (!presentation) return theme
+  const { backgroundSky, ...lighting } = presentation.lighting ?? {}
+  return {
+    ...theme,
+    ...lighting,
+    ...(backgroundSky === undefined ? {} : { backgroundSky }),
+    toneMappingExposure: presentation.exposure ?? theme.toneMappingExposure,
+    postprocessing: presentation.postprocessing,
+  }
 }
 
 export const SCENE_THEMES: SceneTheme[] = [
@@ -29,13 +42,14 @@ export const SCENE_THEMES: SceneTheme[] = [
     id: 'studio',
     name: 'Studio',
     appearance: 'light',
-    background: '#ffffff',
-    ground: '#f4f4f2',
+    background: '#fbfbfa',
+    backgroundSky: '#b6cfe7',
+    ground: '#e9e7e2',
     ambient: { color: '#ffffff', intensity: 0.15 },
-    hemi: { sky: '#ffffff', ground: '#aaa49a', intensity: 0.6 },
+    hemi: { sky: '#ffffff', ground: '#aaa49a', intensity: 0.45 },
     lights: [
       { position: [10, 10, 10], color: '#ffffff', intensity: 4, castShadow: true },
-      { position: [-10, 10, -10], color: '#ffffff', intensity: 0.75 },
+      { position: [-10, 10, -10], color: '#ffffff', intensity: 0.6 },
     ],
     toneMappingExposure: 0.9,
     clayTints: {
@@ -51,6 +65,7 @@ export const SCENE_THEMES: SceneTheme[] = [
     name: 'Paper',
     appearance: 'light',
     background: '#ede9df',
+    backgroundSky: '#c0d2e4',
     ground: '#e7e1d3',
     ambient: { color: '#fff9eb', intensity: 0.55 },
     hemi: { sky: '#fff5d9', ground: '#c2b89c', intensity: 0.35 },
@@ -72,6 +87,7 @@ export const SCENE_THEMES: SceneTheme[] = [
     name: 'Sunset',
     appearance: 'light',
     background: '#f6e8d4',
+    backgroundSky: '#b5bede',
     ground: '#ecd9bf',
     ambient: { color: '#ffd9a8', intensity: 0.45 },
     hemi: { sky: '#ffd9a8', ground: '#5b4634', intensity: 0.4 },
@@ -93,11 +109,12 @@ export const SCENE_THEMES: SceneTheme[] = [
     name: 'Overcast',
     appearance: 'light',
     background: '#e6e7e6',
+    backgroundSky: '#c3ccd6',
     ground: '#dadcd9',
     ambient: { color: '#eef0ef', intensity: 1.1 },
     hemi: { sky: '#f4f5f3', ground: '#bcbfbb', intensity: 0.9 },
     lights: [{ position: [12, 28, 10], color: '#f4f5f3', intensity: 0.8, castShadow: true }],
-    toneMappingExposure: 0.95,
+    toneMappingExposure: 0.9,
     clayTints: {
       wall: '#dedfdc',
       floor: '#cdcec9',
@@ -111,6 +128,7 @@ export const SCENE_THEMES: SceneTheme[] = [
     name: 'Blueprint',
     appearance: 'light',
     background: '#dde6ef',
+    backgroundSky: '#a5c4e2',
     ground: '#c9d6e6',
     ambient: { color: '#cfdcec', intensity: 0.7 },
     hemi: { sky: '#dfeaf6', ground: '#5b6b80', intensity: 0.55 },
@@ -118,7 +136,7 @@ export const SCENE_THEMES: SceneTheme[] = [
       { position: [16, 24, 12], color: '#e6efff', intensity: 1.8, castShadow: true },
       { position: [-12, 10, -8], color: '#9fb6d8', intensity: 0.4 },
     ],
-    toneMappingExposure: 0.95,
+    toneMappingExposure: 0.9,
     clayTints: {
       wall: '#9fb6d2',
       floor: '#8ba2c2',
@@ -132,6 +150,7 @@ export const SCENE_THEMES: SceneTheme[] = [
     name: 'Mediterranean',
     appearance: 'light',
     background: '#bdd6e8',
+    backgroundSky: '#8ab4d6',
     ground: '#ddd2bb',
     ambient: { color: '#d6e6f3', intensity: 0.5 },
     hemi: { sky: '#a8c8e2', ground: '#d8c9a4', intensity: 0.6 },
@@ -153,14 +172,15 @@ export const SCENE_THEMES: SceneTheme[] = [
     name: 'Twilight',
     appearance: 'dark',
     background: '#3a3550',
-    ground: '#4a4566',
-    ambient: { color: '#a89cc8', intensity: 0.35 },
-    hemi: { sky: '#d8a8c0', ground: '#1c1830', intensity: 0.5 },
+    backgroundSky: '#272338',
+    ground: '#67618a',
+    ambient: { color: '#a89cc8', intensity: 0.55 },
+    hemi: { sky: '#d8a8c0', ground: '#3a3450', intensity: 0.7 },
     lights: [
       { position: [-14, 22, -10], color: '#a4b6e8', intensity: 1.4, castShadow: true },
       { position: [14, 6, 8], color: '#ffb070', intensity: 0.9 },
     ],
-    toneMappingExposure: 1.1,
+    toneMappingExposure: 0.9,
     clayTints: {
       wall: '#c5b9cf',
       floor: '#ad9fbb',
@@ -174,12 +194,13 @@ export const SCENE_THEMES: SceneTheme[] = [
     name: 'Night',
     appearance: 'dark',
     background: '#1f2433',
-    ground: '#2b3247',
-    ambient: { color: '#a0b0ff', intensity: 0.07 },
-    hemi: { sky: '#3a4666', ground: '#0e111c', intensity: 0.4 },
+    backgroundSky: '#12161f',
+    ground: '#4a5470',
+    ambient: { color: '#a0b0ff', intensity: 0.25 },
+    hemi: { sky: '#3a4666', ground: '#232a3d', intensity: 0.55 },
     lights: [
-      { position: [10, 10, 10], color: '#e0e5ff', intensity: 0.8, castShadow: true },
-      { position: [-10, 10, -10], color: '#8090ff', intensity: 0.2 },
+      { position: [10, 10, 10], color: '#e0e5ff', intensity: 1.2, castShadow: true },
+      { position: [-10, 10, -10], color: '#8090ff', intensity: 0.3 },
     ],
     toneMappingExposure: 0.9,
     clayTints: {
@@ -195,6 +216,7 @@ export const SCENE_THEMES: SceneTheme[] = [
     name: 'Verdant',
     appearance: 'light',
     background: '#d6e4d2',
+    backgroundSky: '#aecde0',
     ground: '#c7d6b4',
     ambient: { color: '#e3efdd', intensity: 0.5 },
     hemi: { sky: '#cfe6cf', ground: '#8ea06f', intensity: 0.65 },
@@ -202,7 +224,7 @@ export const SCENE_THEMES: SceneTheme[] = [
       { position: [16, 22, 12], color: '#fff6d8', intensity: 3, castShadow: true },
       { position: [-12, 10, -8], color: '#bfe0c2', intensity: 0.5 },
     ],
-    toneMappingExposure: 0.95,
+    toneMappingExposure: 0.9,
     clayTints: {
       wall: '#eef0e6',
       floor: '#d8ddc6',
@@ -220,3 +242,26 @@ const SCENE_THEME_BY_ID = new Map(SCENE_THEMES.map((theme) => [theme.id, theme])
 export function getSceneTheme(id: string): SceneTheme {
   return SCENE_THEME_BY_ID.get(id) ?? SCENE_THEMES[0]!
 }
+
+/**
+ * The dark mode the eye dives into under the ground: a neutral anthracite / slate grey, no hue.
+ * Neither dark scene theme is neutral (`night` is navy, `twilight` is purple), and a theme would
+ * be a thing the person picks, so the underground has its own palette, here beside the theme
+ * tokens (`lib/underground-ambiance.ts` is its one reader). Every stop is a grey (R = G = B);
+ * the backdrop is the theme backdrop's own gradient (`lib/backdrop.ts`) in these stops.
+ */
+export const UNDERGROUND_PALETTE = {
+  /** The backdrop looking down, most of the frame under the lid: slate grey. */
+  background: '#4a4a4a',
+  /** The thin band hugging the horizon. */
+  haze: '#666666',
+  /** The sky above the horizon, and its zenith. */
+  sky: '#1b1b1b',
+  skyDeep: '#111111',
+  /** The corners the vignette closes in to. */
+  vignette: '#0c0c0c',
+  /** The thin rim along the cut of the hole in the ground, from above. */
+  rim: '#3c3c3c',
+  /** The sky light's tint (ambient and hemisphere pulled toward it under the ground). */
+  tint: '#c8c8c8',
+} as const

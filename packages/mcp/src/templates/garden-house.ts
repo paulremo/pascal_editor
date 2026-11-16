@@ -1,3 +1,4 @@
+import { NEW_DOOR_FRAME_THICKNESS } from '@pascal-app/core/building'
 import type { SceneGraph } from '@pascal-app/core/clone-scene-graph'
 import type { AnyNode, AnyNodeId } from '@pascal-app/core/schema'
 
@@ -15,11 +16,14 @@ import type { AnyNode, AnyNodeId } from '@pascal-app/core/schema'
  *   - 2 windows on the south wall, 1 window on each of east and west
  *   - 1 indoor "living" zone, 1 outdoor "garden" zone
  *   - 3 fence segments bounding the north/east/west of the garden
+ *
+ * Coordinate system: `[x, z]` on the XZ plane, with `x` running east/west
+ * and `z` running north/south (positive z points south).
  */
 
 const HOUSE_W = 6 // half-width of the house (12 m total)
 const HOUSE_D = 4 // half-depth of the house (8 m total)
-const GARDEN_DEPTH = 6 // depth of the back-garden zone along +z direction
+const GARDEN_DEPTH = 6 // depth of the back-garden zone along -z (north)
 
 const WALL_THICKNESS = 0.15
 const WALL_HEIGHT = 2.7
@@ -41,7 +45,6 @@ function wall(
     metadata: {},
     children,
     thickness: WALL_THICKNESS,
-    height: WALL_HEIGHT,
     start,
     end,
     frontSide: 'unknown',
@@ -62,8 +65,7 @@ function door(id: string, parentWallId: string, width = 0.9): AnyNode {
     rotation: [0, 0, 0],
     width,
     height: 2.1,
-    frameThickness: 0.05,
-    frameDepth: 0.07,
+    frameThickness: NEW_DOOR_FRAME_THICKNESS,
     threshold: true,
     thresholdHeight: 0.02,
     hingesSide: 'left',
@@ -110,7 +112,6 @@ function makeWindow(id: string, parentWallId: string, width = 1.2): AnyNode {
     width,
     height: 1.2,
     frameThickness: 0.05,
-    frameDepth: 0.07,
     columnRatios: [1],
     rowRatios: [1],
     columnDividerThickness: 0.03,
@@ -250,6 +251,7 @@ function buildTemplate(): SceneGraph {
     visible: true,
     metadata: {},
     level: 0,
+    height: WALL_HEIGHT,
     children: [
       'wall_n',
       'wall_e',

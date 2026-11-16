@@ -1,6 +1,12 @@
 import { describe, expect, test } from 'bun:test'
-import type { RoofSegmentNode } from '@pascal-app/core'
-import { getRoofSegmentPlanLinework } from './floorplan'
+import {
+  type FloorplanGeometry,
+  type GeometryContext,
+  getRoofSegmentVisibleTopBounds,
+  RoofNode,
+  type RoofSegmentNode,
+} from '@pascal-app/core'
+import { buildRoofSegmentFloorplan, getRoofSegmentPlanLinework } from './floorplan'
 
 function dutchSegment(overrides: Partial<RoofSegmentNode> = {}): RoofSegmentNode {
   return {
@@ -34,6 +40,79 @@ function dutchSegment(overrides: Partial<RoofSegmentNode> = {}): RoofSegmentNode
 }
 
 describe('getRoofSegmentPlanLinework', () => {
+  test('renders conical selection and hit chrome as a circle', () => {
+    const roof = RoofNode.parse({ id: 'roof_test', children: ['rseg_test'] })
+    const node = dutchSegment({
+      parentId: roof.id,
+      roofType: 'conical',
+      width: 6,
+      depth: 6,
+    })
+    const geometry = buildRoofSegmentFloorplan(node, {
+      parent: roof,
+      viewState: { selected: true },
+    } as GeometryContext) as Extract<FloorplanGeometry, { kind: 'group' }>
+
+    expect(geometry.kind).toBe('group')
+    expect(geometry.children.filter((child) => child.kind === 'circle')).toHaveLength(2)
+    expect(geometry.children.some((child) => child.kind === 'polygon')).toBe(false)
+    expect(geometry.children.some((child) => child.kind === 'rotate-arrow')).toBe(false)
+    const resizeArrows = geometry.children.filter((child) => child.kind === 'move-arrow')
+    expect(resizeArrows).toHaveLength(1)
+    expect(resizeArrows[0]).toMatchObject({ payload: { mode: 'radial' } })
+    expect(getRoofSegmentPlanLinework(node)).toEqual({
+      ridges: [],
+      hips: [],
+      breaks: [],
+      slope: null,
+    })
+  })
+
+  test('renders a conical sector as a clipped polygon', () => {
+    const roof = RoofNode.parse({ id: 'roof_test', children: ['rseg_test'] })
+    const node = dutchSegment({
+      parentId: roof.id,
+      roofType: 'conical',
+      width: 6,
+      depth: 6,
+      conicalStartAngle: 0,
+      conicalSweepAngle: Math.PI,
+    })
+    const geometry = buildRoofSegmentFloorplan(node, {
+      parent: roof,
+      viewState: { selected: true },
+    } as GeometryContext) as Extract<FloorplanGeometry, { kind: 'group' }>
+    const polygons = geometry.children.filter(
+      (child): child is Extract<FloorplanGeometry, { kind: 'polygon' }> => child.kind === 'polygon',
+    )
+
+    expect(geometry.children.some((child) => child.kind === 'circle')).toBe(false)
+    expect(polygons).toHaveLength(2)
+    expect(polygons[0]?.points[0]).toEqual([0, 0])
+    expect(polygons[0]?.points).toHaveLength(26)
+    expect(geometry.children.some((child) => child.kind === 'rotate-arrow')).toBe(false)
+  })
+
+  test('renders a clipped conical sector as a circle when full coverage is enabled', () => {
+    const roof = RoofNode.parse({ id: 'roof_test', children: ['rseg_test'] })
+    const node = dutchSegment({
+      parentId: roof.id,
+      roofType: 'conical',
+      width: 6,
+      depth: 6,
+      conicalFullCircle: true,
+      conicalStartAngle: 0,
+      conicalSweepAngle: Math.PI,
+    })
+    const geometry = buildRoofSegmentFloorplan(node, {
+      parent: roof,
+      viewState: { selected: true },
+    } as GeometryContext) as Extract<FloorplanGeometry, { kind: 'group' }>
+
+    expect(geometry.children.filter((child) => child.kind === 'circle')).toHaveLength(2)
+    expect(geometry.children.some((child) => child.kind === 'polygon')).toBe(false)
+  })
+
   test('draws a dutch width-axis upper ridge plus waist linework', () => {
     const linework = getRoofSegmentPlanLinework(dutchSegment())
 
@@ -135,5 +214,39 @@ describe('getRoofSegmentPlanLinework', () => {
         [-1.25, 1.5],
       ],
     ])
+  })
+})
+
+describe("a selected roof plane's handles", () => {
+  const roof = RoofNode.parse({ id: 'roof_test', children: ['rseg_test'] })
+  const node = dutchSegment({ parentId: roof.id, roofType: 'gable' })
+  const geometry = buildRoofSegmentFloorplan(node, {
+    parent: roof,
+    viewState: { selected: true },
+  } as GeometryContext) as Extract<FloorplanGeometry, { kind: 'group' }>
+  const eave = getRoofSegmentVisibleTopBounds(node)
+
+  test('the rotate handle sits past the eave corner, sized to a roof', () => {
+    const rotate = geometry.children.find((child) => child.kind === 'rotate-arrow')
+    expect(rotate).toMatchObject({ scale: 2 })
+    const [x, z] = (rotate as Extract<FloorplanGeometry, { kind: 'rotate-arrow' }>).point
+    expect(x).toBeGreaterThan(eave.maxX)
+    expect(z).toBeGreaterThan(eave.maxZ)
+  })
+
+  test('the resize arrows sit past the eaves and rakes', () => {
+    const arrows = geometry.children.filter(
+      (child): child is Extract<FloorplanGeometry, { kind: 'move-arrow' }> =>
+        child.kind === 'move-arrow',
+    )
+    expect(arrows).toHaveLength(4)
+    for (const { point } of arrows) {
+      expect(
+        point[0] > eave.maxX ||
+          point[0] < eave.minX ||
+          point[1] > eave.maxZ ||
+          point[1] < eave.minZ,
+      ).toBe(true)
+    }
   })
 })

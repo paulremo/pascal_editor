@@ -2,13 +2,13 @@
 
 import '../../../three-types'
 
-import { Html } from '@react-three/drei'
+import { formatLinearMeasurement, type LinearUnit, type MetricNotation } from '@pascal-app/core'
+import { LocalizedHtml as Html } from '@pascal-app/viewer/ui'
 import { useEffect, useMemo } from 'react'
 import { PlaneGeometry } from 'three'
 import { distance, smoothstep, uv, vec2 } from 'three/tsl'
 import { LineBasicNodeMaterial, MeshBasicNodeMaterial } from 'three/webgpu'
 import { EDITOR_LAYER } from '../../../lib/constants'
-import { formatLinearMeasurement, type LinearUnit } from '../../../lib/measurements'
 import { createLineGeometry, getBoxEdgePoints } from './placement-box-geometry'
 
 const VALID_COLOR = 0x22_c5_5e // green-500
@@ -17,6 +17,7 @@ const MEASUREMENT_COLOR = 0x0f_17_2a
 
 type PlacementBoxMeasurements = {
   unit: LinearUnit
+  metricNotation?: MetricNotation
 }
 
 function getMeasurementGuidePoints(width: number, height: number, depth: number) {
@@ -99,15 +100,24 @@ function getMeasurementGuidePoints(width: number, height: number, depth: number)
 }
 
 function MeasurementPill({
+  active,
   label,
+  onSelect,
   position,
 }: {
+  active?: boolean
   label: string
+  onSelect?: () => void
   position: [number, number, number]
 }) {
   return (
-    <Html center position={position} style={{ pointerEvents: 'none' }}>
-      <div
+    <Html center position={position} style={{ pointerEvents: onSelect ? 'auto' : 'none' }}>
+      <button
+        className={active ? 'ring-1 ring-indigo-200' : undefined}
+        onClick={(event) => {
+          event.stopPropagation()
+          onSelect?.()
+        }}
         style={{
           background: 'rgba(15, 23, 42, 0.86)',
           border: '1px solid rgba(15, 23, 42, 0.65)',
@@ -118,12 +128,13 @@ function MeasurementPill({
           fontWeight: 600,
           lineHeight: 1,
           padding: '4px 8px',
-          pointerEvents: 'none',
+          pointerEvents: onSelect ? 'auto' : 'none',
           whiteSpace: 'nowrap',
         }}
+        type="button"
       >
         {label}
-      </div>
+      </button>
     </Html>
   )
 }
@@ -142,8 +153,12 @@ function MeasurementPill({
  * a shelf — lines up without an extra offset.
  */
 export function PlacementBox({
+  activeDimensionId,
   dimensions,
+  dimensionInput = '',
   measurements,
+  measurementValues,
+  onDimensionSelect,
   position,
   rotationY = 0,
   valid,
@@ -152,14 +167,20 @@ export function PlacementBox({
   dimensions: [number, number, number]
   /** Optional dimension guide labels matching the GLB item placement cursor. */
   measurements?: PlacementBoxMeasurements
+  /** Values represented by the editable dimension pills; defaults to the box dimensions. */
+  measurementValues?: [width: number, height: number, depth: number]
   /** World-plan position of the footprint centre (floor level). */
   position: [number, number, number]
   /** Y-rotation in radians, applied to the whole box. */
   rotationY?: number
   /** Drives the colour: green when placeable, red otherwise. */
   valid: boolean
+  activeDimensionId?: string | null
+  dimensionInput?: string
+  onDimensionSelect?: (id: string) => void
 }) {
   const [width, height, depth] = dimensions
+  const [measurementWidth, measurementHeight, measurementDepth] = measurementValues ?? dimensions
 
   const edgeGeometry = useMemo(
     () =>
@@ -271,15 +292,45 @@ export function PlacementBox({
         renderOrder={998}
       />
       <MeasurementPill
-        label={formatLinearMeasurement(width, measurements.unit)}
+        active={activeDimensionId === 'cabinet-width'}
+        label={
+          activeDimensionId === 'cabinet-width' && dimensionInput
+            ? dimensionInput
+            : formatLinearMeasurement(
+                measurementWidth,
+                measurements.unit,
+                measurements.metricNotation,
+              )
+        }
+        onSelect={onDimensionSelect ? () => onDimensionSelect('cabinet-width') : undefined}
         position={[0, 0.04, depth / 2 + 0.24]}
       />
       <MeasurementPill
-        label={formatLinearMeasurement(depth, measurements.unit)}
+        active={activeDimensionId === 'cabinet-depth'}
+        label={
+          activeDimensionId === 'cabinet-depth' && dimensionInput
+            ? dimensionInput
+            : formatLinearMeasurement(
+                measurementDepth,
+                measurements.unit,
+                measurements.metricNotation,
+              )
+        }
+        onSelect={onDimensionSelect ? () => onDimensionSelect('cabinet-depth') : undefined}
         position={[width / 2 + 0.24, 0.04, 0]}
       />
       <MeasurementPill
-        label={formatLinearMeasurement(height, measurements.unit)}
+        active={activeDimensionId === 'cabinet-height'}
+        label={
+          activeDimensionId === 'cabinet-height' && dimensionInput
+            ? dimensionInput
+            : formatLinearMeasurement(
+                measurementHeight,
+                measurements.unit,
+                measurements.metricNotation,
+              )
+        }
+        onSelect={onDimensionSelect ? () => onDimensionSelect('cabinet-height') : undefined}
         position={[-width / 2 - 0.24, height / 2, -depth / 2]}
       />
     </>

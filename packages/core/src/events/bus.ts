@@ -1,7 +1,10 @@
 import type { ThreeEvent } from '@react-three/fiber'
 import mitt from 'mitt'
 import type { Object3D } from 'three'
+import type { PointAskPin, PointAskStatus } from '../agent-operations/point-context'
+import type { SceneViewInterior, SceneViewPresentation } from '../agent-operations/scene-view'
 import type {
+  BlockNode,
   BoxVentNode,
   BuildingNode,
   CabinetModuleNode,
@@ -9,6 +12,7 @@ import type {
   CeilingNode,
   ChimneyNode,
   ColumnNode,
+  ConstructionDimensionNode,
   CupolaNode,
   DoorNode,
   DormerNode,
@@ -22,10 +26,13 @@ import type {
   GuideNode,
   GutterNode,
   HvacEquipmentNode,
+  ImportedMeshNode,
   ItemNode,
+  LeanToExtensionNode,
   LevelNode,
   LinesetNode,
   LiquidLineNode,
+  MeasurementNode,
   PipeFittingNode,
   PipeSegmentNode,
   PipeTrapNode,
@@ -33,6 +40,7 @@ import type {
   RoofNode,
   RoofSegmentNode,
   ScanNode,
+  SeparatorNode,
   ShelfNode,
   SiteNode,
   SkylightNode,
@@ -41,23 +49,32 @@ import type {
   SpawnNode,
   StairNode,
   StairSegmentNode,
+  StructuralGridNode,
   TurbineVentNode,
+  UnitNode,
   WallNode,
   WindowNode,
   ZoneNode,
 } from '../schema'
-import type { AnyNode } from '../schema/types'
+import type { AnyNode, AnyNodeId } from '../schema/types'
 
 // Base event interfaces
 export interface GridEvent {
-  /** World-space intersection point on the grid plane. */
+  /** World-space intersection point on the floor grid or a scene surface. */
   position: [number, number, number]
   /**
-   * Building-local intersection point — relative to the currently selected building.
-   * Equals `position` when no building is selected.
+   * Intersection in localFrameId when specified, otherwise the selected building.
+   * Equals `position` when neither frame is available.
    * Use this for placing/committing anything that lives inside a building (walls, slabs, items, etc.).
    */
   localPosition: [number, number, number]
+  /** Explicit scene-node coordinate frame for local fields, when provided. */
+  localFrameId?: AnyNodeId
+  /** Pointer ray in the same coordinate frame as `localPosition`. */
+  localRay?: {
+    origin: [number, number, number]
+    direction: [number, number, number]
+  }
   faceIndex?: number
   /**
    * Optional: the hit Three.js object. Present when the grid event was
@@ -67,6 +84,20 @@ export interface GridEvent {
    * the intersection to.
    */
   object?: Object3D
+  /** Architectural hit in the same coordinate frame as localPosition. */
+  surfaceLocalPosition?: [number, number, number]
+  /** Outward normal in the same coordinate frame as localPosition. */
+  surfaceNormal?: [number, number, number]
+  /** The architectural surface object hit by the cursor, when available. */
+  surfaceObject?: Object3D
+  /** Semantic architectural hit for scoped placement/drafting tools. */
+  surfaceHit?: {
+    kind: 'wall' | 'ceiling' | 'slab' | 'roof'
+    hostId: AnyNodeId
+    levelId?: AnyNodeId
+    face: 'side' | 'top' | 'end' | 'unknown'
+    side?: 'front' | 'back'
+  }
   nativeEvent: ThreeEvent<PointerEvent>
 }
 
@@ -89,24 +120,30 @@ export interface NodeEvent<T extends AnyNode = AnyNode> {
 export type WallEvent = NodeEvent<WallNode>
 export type FenceEvent = NodeEvent<FenceNode>
 export type ItemEvent = NodeEvent<ItemNode>
+export type ImportedMeshEvent = NodeEvent<ImportedMeshNode>
 export type SiteEvent = NodeEvent<SiteNode>
 export type BuildingEvent = NodeEvent<BuildingNode>
 export type CabinetEvent = NodeEvent<CabinetNode>
 export type CabinetModuleEvent = NodeEvent<CabinetModuleNode>
 export type LevelEvent = NodeEvent<LevelNode>
+export type LeanToExtensionEvent = NodeEvent<LeanToExtensionNode>
 export type ZoneEvent = NodeEvent<ZoneNode>
 export type ShelfEvent = NodeEvent<ShelfNode>
 export type SlabEvent = NodeEvent<SlabNode>
 export type SpawnEvent = NodeEvent<SpawnNode>
 export type CeilingEvent = NodeEvent<CeilingNode>
 export type ColumnEvent = NodeEvent<ColumnNode>
+export type ConstructionDimensionEvent = NodeEvent<ConstructionDimensionNode>
+export type BlockEvent = NodeEvent<BlockNode>
 export type RoofEvent = NodeEvent<RoofNode>
 export type RoofSegmentEvent = NodeEvent<RoofSegmentNode>
 export type StairEvent = NodeEvent<StairNode>
 export type StairSegmentEvent = NodeEvent<StairSegmentNode>
+export type StructuralGridEvent = NodeEvent<StructuralGridNode>
 export type WindowEvent = NodeEvent<WindowNode>
 export type DoorEvent = NodeEvent<DoorNode>
 export type ElevatorEvent = NodeEvent<ElevatorNode>
+export type UnitEvent = NodeEvent<UnitNode>
 export type ScanEvent = NodeEvent<ScanNode>
 export type GuideEvent = NodeEvent<GuideNode>
 export type BoxVentEvent = NodeEvent<BoxVentNode>
@@ -129,6 +166,8 @@ export type PipeFittingEvent = NodeEvent<PipeFittingNode>
 export type PipeTrapEvent = NodeEvent<PipeTrapNode>
 export type LinesetEvent = NodeEvent<LinesetNode>
 export type LiquidLineEvent = NodeEvent<LiquidLineNode>
+export type MeasurementEvent = NodeEvent<MeasurementNode>
+export type SeparatorEvent = NodeEvent<SeparatorNode>
 
 // Event suffixes - exported for use in hooks
 export const eventSuffixes = [
@@ -144,20 +183,57 @@ export const eventSuffixes = [
 
 export type EventSuffix = (typeof eventSuffixes)[number]
 
-type NodeEvents<T extends string, E> = {
-  [K in `${T}:${EventSuffix}`]: E
+type NodeEvents = {
+  [N in AnyNode as `${N['type']}:${EventSuffix}`]: NodeEvent<N>
 }
 
 type GridEvents = {
   [K in `grid:${EventSuffix}`]: GridEvent
 }
 
+type GenericNodeEvents = {
+  [K in `node:${EventSuffix}`]: NodeEvent<AnyNode>
+}
+
 export interface CameraControlEvent {
   nodeId: AnyNode['id']
 }
 
+export interface SnapshotCapturePose {
+  position: [number, number, number]
+  quaternion: [number, number, number, number]
+  /** Vertical field of view in degrees in the final standard-size output. */
+  fov: number
+}
+
+export interface SnapshotSavedEvent {
+  requestId?: string
+  projectId?: string
+  id: string
+  url: string
+  width: number
+  height: number
+}
+
+export interface SnapshotCaptureFailedEvent {
+  requestId: string
+  error: string
+}
+
+/** An ephemeral capture's frame, handed back to the caller that asked for it. */
+export interface SnapshotCapturedEvent {
+  requestId: string
+  blob: Blob
+  width: number
+  height: number
+  presentation?: SceneViewPresentation
+}
+
 export interface ThumbnailGenerateEvent {
   projectId: string
+  requestId?: string
+  /** World-space pose for a standard capture without moving the viewport camera. */
+  cameraPose?: SnapshotCapturePose
   captureMode?: 'standard' | 'viewport' | 'area'
   cropRegion?: { x: number; y: number; width: number; height: number }
   /**
@@ -179,6 +255,38 @@ export interface ThumbnailGenerateEvent {
    * any palette background.
    */
   transparent?: boolean
+  // ── a sheet's picture ──
+  /** The ink edges wanted for this frame, else the canvas' setting (off with alpha). */
+  edges?: 'off' | 'soft' | 'strong'
+  /** An orthographic view of the caller's own: the capture camera at `position` looking at `target`, `viewWidth` metres across. */
+  ortho?: {
+    position: [number, number, number]
+    target: [number, number, number]
+    viewWidth: number
+  }
+  /** Node types hidden for this capture besides the helpers (a sheet's elevation hides the terrain). */
+  hideTypes?: readonly string[]
+  /** A perspective view of the caller's own (a sheet's cover view); the user's camera never moves. */
+  perspective?: {
+    position: [number, number, number]
+    target: [number, number, number]
+    fov?: number
+  }
+  /** Re-aim the sun at the face the pose looks at, for this frame. */
+  lightFace?: boolean
+  /**
+   * The frame is the caller's alone: it comes back on `snapshot:captured` (matched by `requestId`)
+   * and the host stores nothing — no snapshot, no thumbnail. An agent looking at the scene.
+   */
+  ephemeral?: boolean
+  /** World clipping planes for this frame (a section's cut). */
+  clip?: readonly { normal: [number, number, number]; constant: number }[]
+  /** Look inside this floor for the frame: the rest of the house left out, its walls cut (view_scene). */
+  interior?: SceneViewInterior
+  /** The actual Solo/Exploded/Stacked presentation, without interior clipping. */
+  presentation?: SceneViewPresentation
+  /** Render the canvas at this multiple of its size for the frame (print-scale pictures). */
+  supersample?: number
 }
 
 export interface CameraControlFitSceneEvent {
@@ -196,6 +304,25 @@ export interface CameraControlFitSceneEvent {
   }
 }
 
+/**
+ * Frames something for the viewer surfaces' navigation (a floor, a room, a
+ * unit): the camera owner sets the distance and keeps its heading. A view
+ * saved on the node wins over the box.
+ */
+export interface CameraControlFrameEvent {
+  bounds: { min: [number, number, number]; max: [number, number, number] } | null
+  pose?: { position: [number, number, number]; target: [number, number, number] }
+}
+
+export interface CameraPose {
+  position: [number, number, number]
+  target: [number, number, number]
+  projection: 'perspective' | 'orthographic'
+  /** Width, in scene units, of the visible plane through `target`. */
+  viewWidth?: number
+  fov?: number
+}
+
 type CameraControlEvents = {
   'camera-controls:view': CameraControlEvent
   'camera-controls:focus': CameraControlEvent
@@ -204,7 +331,17 @@ type CameraControlEvents = {
   'camera-controls:orbit-cw': undefined
   'camera-controls:orbit-ccw': undefined
   'camera-controls:fit-scene': CameraControlFitSceneEvent
+  'camera-controls:frame': CameraControlFrameEvent
   'camera-controls:generate-thumbnail': ThumbnailGenerateEvent
+  /**
+   * A run of captures as one session (a sheet's pictures, an agent's view): while `active`, the
+   * editor presents the finished house (full-height walls, the storeys stacked, the materials' own
+   * look) and the viewport keeps its last frame, so the person never sees the switch.
+   */
+  'camera-controls:capture-session': { owner: string; active: boolean }
+  'camera-controls:apply-pose': CameraPose
+  'camera-controls:cancel-pose': undefined
+  'camera-controls:interaction-start': undefined
 }
 
 type ToolEvents = {
@@ -227,17 +364,25 @@ type DoorAnimationEvents = {
 type WindowAnimationEvents = {
   'window:animation-completed': {
     windowId: WindowNode['id']
-    field: 'operationState'
+    field: 'operationState' | 'shutterOpen' | 'rollerShutterOpen'
   }
 }
 
+type ProceduralMotionEvents = {
+  /** A procedural item's commanded run (`motionCommand.sequence`) has its moving parts at rest. */
+  'procedural:motion-settled': { nodeId: AnyNodeId; sequence: number }
+}
+
 type ThumbnailEvents = {
-  'thumbnail:before-capture': undefined
+  /** `wholeWalls`: every wall drawn whole for the frame, whatever the wall mode (an authored pose, an interior view). */
+  'thumbnail:before-capture': { wholeWalls?: boolean } | undefined
   'thumbnail:after-capture': undefined
 }
 
 type SnapshotEvents = {
-  'snapshot:saved': undefined
+  'snapshot:saved': undefined | SnapshotSavedEvent
+  'snapshot:capture-failed': SnapshotCaptureFailedEvent
+  'snapshot:captured': SnapshotCapturedEvent
   'camera:go-to-position': { position: [number, number, number]; target: [number, number, number] }
 }
 
@@ -251,11 +396,25 @@ export interface RoomPresetCreateEvent {
   zoneId: ZoneNode['id']
 }
 
+type PointAskEvents = {
+  /** The chat's word on an ask's turn, for its pin. */
+  'point-ask:status': PointAskStatus
+  /** The pin tells the chat to light or open the ask's turn. */
+  'point-ask:pin': PointAskPin
+}
+
 type RoomPresetEvents = {
   'room-preset:create': RoomPresetCreateEvent
 }
 
 type SelectionEvents = {
+  /**
+   * A node click accepted by an editor canvas selection path (2D or 3D) after
+   * proxy routing. Hosts can react to the user's selection intent without
+   * treating programmatic selection changes as canvas clicks. Part of the
+   * plugin-facing bus: the WebXR plugin listens for it.
+   */
+  'selection:canvas-node-click': AnyNode
   /**
    * "Reveal this node" intent — the editor's node action menu emits it with the
    * selected node; whoever owns the node's catalog/panel (host browser, a
@@ -264,50 +423,31 @@ type SelectionEvents = {
   'selection:find-node': AnyNode
 }
 
+/** What a door, a window, its shutters or a switch sounds like when someone operates it. */
+export type InteractionSound =
+  | 'door-open'
+  | 'door-swing'
+  | 'door-close'
+  | 'window-open'
+  | 'window-swing'
+  | 'window-close'
+  | 'garage'
+  | 'shutters-open'
+  | 'shutters-close'
+  | 'panel-open'
+  | 'panel-swing'
+  | 'panel-close'
+  | 'switch-on'
+  | 'switch-off'
+
+type InteractionEvents = {
+  /** A person operated something in a viewer; the host plays it if it has sound. */
+  'interaction:sound': InteractionSound
+}
+
 type EditorEvents = GridEvents &
-  NodeEvents<'wall', WallEvent> &
-  NodeEvents<'fence', FenceEvent> &
-  NodeEvents<'cabinet', CabinetEvent> &
-  NodeEvents<'cabinet-module', CabinetModuleEvent> &
-  NodeEvents<'item', ItemEvent> &
-  NodeEvents<'site', SiteEvent> &
-  NodeEvents<'building', BuildingEvent> &
-  NodeEvents<'elevator', ElevatorEvent> &
-  NodeEvents<'level', LevelEvent> &
-  NodeEvents<'zone', ZoneEvent> &
-  NodeEvents<'slab', SlabEvent> &
-  NodeEvents<'shelf', ShelfEvent> &
-  NodeEvents<'spawn', SpawnEvent> &
-  NodeEvents<'ceiling', CeilingEvent> &
-  NodeEvents<'column', ColumnEvent> &
-  NodeEvents<'roof', RoofEvent> &
-  NodeEvents<'roof-segment', RoofSegmentEvent> &
-  NodeEvents<'stair', StairEvent> &
-  NodeEvents<'stair-segment', StairSegmentEvent> &
-  NodeEvents<'window', WindowEvent> &
-  NodeEvents<'door', DoorEvent> &
-  NodeEvents<'scan', ScanEvent> &
-  NodeEvents<'guide', GuideEvent> &
-  NodeEvents<'box-vent', BoxVentEvent> &
-  NodeEvents<'ridge-vent', RidgeVentEvent> &
-  NodeEvents<'turbine-vent', TurbineVentEvent> &
-  NodeEvents<'cupola', CupolaEvent> &
-  NodeEvents<'eyebrow-vent', EyebrowVentEvent> &
-  NodeEvents<'gutter', GutterEvent> &
-  NodeEvents<'chimney', ChimneyEvent> &
-  NodeEvents<'solar-panel', SolarPanelEvent> &
-  NodeEvents<'skylight', SkylightEvent> &
-  NodeEvents<'dormer', DormerEvent> &
-  NodeEvents<'downspout', DownspoutEvent> &
-  NodeEvents<'duct-segment', DuctSegmentEvent> &
-  NodeEvents<'duct-fitting', DuctFittingEvent> &
-  NodeEvents<'duct-terminal', DuctTerminalEvent> &
-  NodeEvents<'hvac-equipment', HvacEquipmentEvent> &
-  NodeEvents<'pipe-segment', PipeSegmentEvent> &
-  NodeEvents<'pipe-fitting', PipeFittingEvent> &
-  NodeEvents<'pipe-trap', PipeTrapEvent> &
-  NodeEvents<'lineset', LinesetEvent> &
-  NodeEvents<'liquid-line', LiquidLineEvent> &
+  GenericNodeEvents &
+  NodeEvents &
   CameraControlEvents &
   ToolEvents &
   GuideEvents &
@@ -316,7 +456,10 @@ type EditorEvents = GridEvents &
   ThumbnailEvents &
   SnapshotEvents &
   AIChatEvents &
+  PointAskEvents &
   RoomPresetEvents &
-  SelectionEvents
+  SelectionEvents &
+  InteractionEvents &
+  ProceduralMotionEvents
 
 export const emitter = mitt<EditorEvents>()

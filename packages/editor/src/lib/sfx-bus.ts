@@ -1,5 +1,15 @@
+import type { TerrainVerb } from '@pascal-app/core'
+import { initInteractionSounds } from '@pascal-app/viewer/sfx'
 import mitt from 'mitt'
-import { playSFX } from './sfx-player'
+import {
+  disposeSFX,
+  type LoopSFXName,
+  playSFX,
+  preloadSFX,
+  startLoopSFX,
+  stopLoopSFX,
+  updateSFXVolumes,
+} from './sfx-player'
 
 /**
  * SFX-specific events that tools can trigger
@@ -18,7 +28,17 @@ type SFXEvents = {
   'sfx:menu-hover': undefined
   'sfx:menu-click': undefined
   'sfx:paint-apply': undefined
+  'sfx:success': undefined
+  'sfx:turn-done': undefined
+  'sfx:turn-failed': undefined
+  'sfx:turn-needs-input': undefined
+  'sfx:terrain-sculpt-start': TerrainVerb
+  'sfx:terrain-sculpt-stop': undefined
 }
+
+type TriggerSFXEvent = {
+  [Event in keyof SFXEvents]: SFXEvents[Event] extends undefined ? Event : never
+}[keyof SFXEvents]
 
 /**
  * Dedicated event emitter for SFX
@@ -28,6 +48,33 @@ export const sfxEmitter = mitt<SFXEvents>()
 
 let sfxBusInitialized = false
 
+const handleGridSnap = () => playSFX('gridSnap')
+const handleItemDelete = () => playSFX('itemDelete')
+const handleItemPick = () => playSFX('itemPick')
+const handleItemPlace = () => playSFX('itemPlace')
+const handleItemRotate = () => playSFX('itemRotate')
+const handleResize = () => playSFX('resize')
+const handleStructureBuildStart = () => playSFX('structureBuildStart')
+const handleStructureBuild = () => playSFX('structureBuildEnd')
+const handleStructureDelete = () => playSFX('structureDelete')
+const handleSnapshotCapture = () => playSFX('snapshotCapture')
+const handleMenuHover = () => playSFX('menuHover')
+const handleMenuClick = () => playSFX('menuClick')
+const handlePaintApply = () => playSFX('paintApply')
+const handleSuccess = () => playSFX('success')
+const handleTurnDone = () => playSFX('turnDone')
+const handleTurnFailed = () => playSFX('turnFailed')
+const handleTurnNeedsInput = () => playSFX('turnNeedsInput')
+const TERRAIN_LOOP_BY_VERB = {
+  raise: 'terrainRaise',
+  lower: 'terrainLower',
+  flatten: 'terrainFlatten',
+  smooth: 'terrainSmooth',
+} as const satisfies Record<TerrainVerb, LoopSFXName>
+const handleTerrainSculptStart = (verb: TerrainVerb) => startLoopSFX(TERRAIN_LOOP_BY_VERB[verb])
+const handleTerrainSculptStop = () => stopLoopSFX()
+let unsubscribeInteractions: (() => void) | null = null
+
 /**
  * Initialize SFX Bus - connects SFX events to actual sound playback.
  * Safe to call multiple times; re-registration is a no-op once initialized.
@@ -35,20 +82,56 @@ let sfxBusInitialized = false
 export function initSFXBus() {
   if (sfxBusInitialized) return
   sfxBusInitialized = true
-  // Map SFX events to sound playback
-  sfxEmitter.on('sfx:grid-snap', () => playSFX('gridSnap'))
-  sfxEmitter.on('sfx:item-delete', () => playSFX('itemDelete'))
-  sfxEmitter.on('sfx:item-pick', () => playSFX('itemPick'))
-  sfxEmitter.on('sfx:item-place', () => playSFX('itemPlace'))
-  sfxEmitter.on('sfx:item-rotate', () => playSFX('itemRotate'))
-  sfxEmitter.on('sfx:resize', () => playSFX('resize'))
-  sfxEmitter.on('sfx:structure-build-start', () => playSFX('structureBuildStart'))
-  sfxEmitter.on('sfx:structure-build', () => playSFX('structureBuildEnd'))
-  sfxEmitter.on('sfx:structure-delete', () => playSFX('structureDelete'))
-  sfxEmitter.on('sfx:snapshot-capture', () => playSFX('snapshotCapture'))
-  sfxEmitter.on('sfx:menu-hover', () => playSFX('menuHover'))
-  sfxEmitter.on('sfx:menu-click', () => playSFX('menuClick'))
-  sfxEmitter.on('sfx:paint-apply', () => playSFX('paintApply'))
+  sfxEmitter.on('sfx:grid-snap', handleGridSnap)
+  sfxEmitter.on('sfx:item-delete', handleItemDelete)
+  sfxEmitter.on('sfx:item-pick', handleItemPick)
+  sfxEmitter.on('sfx:item-place', handleItemPlace)
+  sfxEmitter.on('sfx:item-rotate', handleItemRotate)
+  sfxEmitter.on('sfx:resize', handleResize)
+  sfxEmitter.on('sfx:structure-build-start', handleStructureBuildStart)
+  sfxEmitter.on('sfx:structure-build', handleStructureBuild)
+  sfxEmitter.on('sfx:structure-delete', handleStructureDelete)
+  sfxEmitter.on('sfx:snapshot-capture', handleSnapshotCapture)
+  sfxEmitter.on('sfx:menu-hover', handleMenuHover)
+  sfxEmitter.on('sfx:menu-click', handleMenuClick)
+  sfxEmitter.on('sfx:paint-apply', handlePaintApply)
+  sfxEmitter.on('sfx:success', handleSuccess)
+  sfxEmitter.on('sfx:turn-done', handleTurnDone)
+  sfxEmitter.on('sfx:turn-failed', handleTurnFailed)
+  sfxEmitter.on('sfx:turn-needs-input', handleTurnNeedsInput)
+  sfxEmitter.on('sfx:terrain-sculpt-start', handleTerrainSculptStart)
+  sfxEmitter.on('sfx:terrain-sculpt-stop', handleTerrainSculptStop)
+  unsubscribeInteractions = initInteractionSounds()
+  preloadSFX()
+  updateSFXVolumes()
+}
+
+export function disposeSFXBus() {
+  if (sfxBusInitialized) {
+    sfxEmitter.off('sfx:grid-snap', handleGridSnap)
+    sfxEmitter.off('sfx:item-delete', handleItemDelete)
+    sfxEmitter.off('sfx:item-pick', handleItemPick)
+    sfxEmitter.off('sfx:item-place', handleItemPlace)
+    sfxEmitter.off('sfx:item-rotate', handleItemRotate)
+    sfxEmitter.off('sfx:resize', handleResize)
+    sfxEmitter.off('sfx:structure-build-start', handleStructureBuildStart)
+    sfxEmitter.off('sfx:structure-build', handleStructureBuild)
+    sfxEmitter.off('sfx:structure-delete', handleStructureDelete)
+    sfxEmitter.off('sfx:snapshot-capture', handleSnapshotCapture)
+    sfxEmitter.off('sfx:menu-hover', handleMenuHover)
+    sfxEmitter.off('sfx:menu-click', handleMenuClick)
+    sfxEmitter.off('sfx:paint-apply', handlePaintApply)
+    sfxEmitter.off('sfx:success', handleSuccess)
+    sfxEmitter.off('sfx:turn-done', handleTurnDone)
+    sfxEmitter.off('sfx:turn-failed', handleTurnFailed)
+    sfxEmitter.off('sfx:turn-needs-input', handleTurnNeedsInput)
+    sfxEmitter.off('sfx:terrain-sculpt-start', handleTerrainSculptStart)
+    sfxEmitter.off('sfx:terrain-sculpt-stop', handleTerrainSculptStop)
+    unsubscribeInteractions?.()
+    unsubscribeInteractions = null
+    sfxBusInitialized = false
+  }
+  disposeSFX()
 }
 
 /**
@@ -56,7 +139,7 @@ export function initSFXBus() {
  * @example
  * triggerSFX('sfx:item-place')
  */
-export function triggerSFX(event: keyof SFXEvents) {
+export function triggerSFX(event: TriggerSFXEvent) {
   sfxEmitter.emit(event)
 }
 

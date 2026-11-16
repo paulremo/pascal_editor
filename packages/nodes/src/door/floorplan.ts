@@ -5,7 +5,21 @@ import type {
   GeometryContext,
   WallNode,
 } from '@pascal-app/core'
+import {
+  getDoorOpeningSize,
+  getWallBodyCenterOffset,
+  openingHostFacing,
+  readFloorplanContext,
+  readFloorplanGeometryMetadata,
+  withFloorplanGeometryMetadata,
+} from '@pascal-app/core'
+import { buildOpeningCasingPlan } from '../shared/opening-casing'
+import {
+  buildOpeningMarkAnnotation,
+  type OpeningFloorplanLevelData,
+} from '../shared/opening-documentation'
 import { buildOpeningPlacementDimensions } from '../shared/opening-placement-dimensions'
+import { resolveOpeningPlanPlane } from '../shared/opening-plane-offset'
 
 /**
  * Stage C floor-plan builder for door. 1:1 visual port of the legacy
@@ -31,15 +45,16 @@ import { buildOpeningPlacementDimensions } from '../shared/opening-placement-dim
  * with no swing arc.
  *   4. Center line through the cutout (matches the legacy's
  *      `getOpeningCenterLine` segment for visual continuity).
+ *   5. Casing legs standing proud of each cased wall face beside the
+ *      cutout (`buildOpeningCasingPlan`).
  *
  * Requires `ctx.parent` to be a wall (door.parentId is the wall it's
  * mounted on). Returns null when the parent isn't a wall (orphaned
  * doors during placement etc.).
  *
- * Skipped vs the full legacy for now: hinge / strike cubes (small
- * indicator squares at the rotation pivots), rounded-opening shape
- * variants, panic bar markers. Those are rare visual variations the
- * follow-up port can revisit.
+ * Swing leaves include hinge / strike indicators and panic hardware
+ * when present. Rounded and arched heads are shown as dashed overhead
+ * lines because their geometry sits above the horizontal plan cut.
  */
 export function buildDoorFloorplan(node: DoorNode, ctx: GeometryContext): FloorplanGeometry | null {
   const wall = ctx.parent as WallNode | null
@@ -60,9 +75,17 @@ export function buildDoorFloorplan(node: DoorNode, ctx: GeometryContext): Floorp
 
   const distance = node.position[0]
   const width = node.width
-  const depth = wall.thickness ?? 0.1
-  const cx = x1 + dirX * distance
-  const cz = z1 + dirZ * distance
+  const opening = getDoorOpeningSize(node)
+  const openingOffset = -opening.leafOffsetX * openingHostFacing(node)
+  const wallDepth = wall.thickness ?? 0.1
+  const plane = resolveOpeningPlanPlane(node, wallDepth)
+  const depth = plane.depth
+  // The plane offset is measured from the body centre, which a justified wall
+  // sets off its reference line.
+  const bodyOffset = getWallBodyCenterOffset(wall)
+  const across = bodyOffset + plane.offset
+  const cx = x1 + dirX * distance + perpX * across
+  const cz = z1 + dirZ * distance + perpZ * across
   const halfWidth = width / 2
   const halfDepth = depth / 2
 
@@ -84,10 +107,42 @@ export function buildDoorFloorplan(node: DoorNode, ctx: GeometryContext): Floorp
 
   // Footprint rectangle in the cutout.
   const points: readonly FloorplanPoint[] = [
-    [cx - dirX * halfWidth + perpX * halfDepth, cz - dirZ * halfWidth + perpZ * halfDepth],
-    [cx + dirX * halfWidth + perpX * halfDepth, cz + dirZ * halfWidth + perpZ * halfDepth],
-    [cx + dirX * halfWidth - perpX * halfDepth, cz + dirZ * halfWidth - perpZ * halfDepth],
-    [cx - dirX * halfWidth - perpX * halfDepth, cz - dirZ * halfWidth - perpZ * halfDepth],
+    [
+      cx + dirX * openingOffset - dirX * (opening.width / 2) + perpX * halfDepth,
+      cz + dirZ * openingOffset - dirZ * (opening.width / 2) + perpZ * halfDepth,
+    ],
+    [
+      cx + dirX * openingOffset + dirX * (opening.width / 2) + perpX * halfDepth,
+      cz + dirZ * openingOffset + dirZ * (opening.width / 2) + perpZ * halfDepth,
+    ],
+    [
+      cx + dirX * openingOffset + dirX * (opening.width / 2) - perpX * halfDepth,
+      cz + dirZ * openingOffset + dirZ * (opening.width / 2) - perpZ * halfDepth,
+    ],
+    [
+      cx + dirX * openingOffset - dirX * (opening.width / 2) - perpX * halfDepth,
+      cz + dirZ * openingOffset - dirZ * (opening.width / 2) - perpZ * halfDepth,
+    ],
+  ]
+
+  const halfWallDepth = wallDepth / 2
+  const openingCutoutPoints = (ox: number, oz: number): FloorplanPoint[] => [
+    [
+      ox + dirX * openingOffset - dirX * (opening.width / 2) + perpX * halfWallDepth,
+      oz + dirZ * openingOffset - dirZ * (opening.width / 2) + perpZ * halfWallDepth,
+    ],
+    [
+      ox + dirX * openingOffset + dirX * (opening.width / 2) + perpX * halfWallDepth,
+      oz + dirZ * openingOffset + dirZ * (opening.width / 2) + perpZ * halfWallDepth,
+    ],
+    [
+      ox + dirX * openingOffset + dirX * (opening.width / 2) - perpX * halfWallDepth,
+      oz + dirZ * openingOffset + dirZ * (opening.width / 2) - perpZ * halfWallDepth,
+    ],
+    [
+      ox + dirX * openingOffset - dirX * (opening.width / 2) - perpX * halfWallDepth,
+      oz + dirZ * openingOffset - dirZ * (opening.width / 2) - perpZ * halfWallDepth,
+    ],
   ]
 
   const view = ctx.viewState
@@ -105,6 +160,24 @@ export function buildDoorFloorplan(node: DoorNode, ctx: GeometryContext): Floorp
   const fillColor = showSelectedChrome ? '#fed7aa' : '#ffffff'
 
   const children: FloorplanGeometry[] = [
+    // An offset frame stands clear of the wall centre, but the wall is still
+    // cut through its whole thickness: draw that hole too.
+    ...(plane.offset === 0
+      ? []
+      : [
+          {
+            kind: 'polygon' as const,
+            points: openingCutoutPoints(
+              x1 + dirX * distance + perpX * bodyOffset,
+              z1 + dirZ * distance + perpZ * bodyOffset,
+            ),
+            fill: fillColor,
+            stroke: accentMuted,
+            strokeWidth: showSelectedChrome ? 2 : 1.25,
+            vectorEffect: 'non-scaling-stroke' as const,
+            strokeLinejoin: 'round' as const,
+          },
+        ]),
     // Background — the cutout is filled white so the swing arc sits on
     // a clean canvas (the wall hatch shows through otherwise).
     {
@@ -117,6 +190,57 @@ export function buildDoorFloorplan(node: DoorNode, ctx: GeometryContext): Floorp
       strokeLinejoin: 'round',
     },
   ]
+
+  for (const [side, extra] of [
+    [-1, node.sidelightLeft ?? 0],
+    [1, node.sidelightRight ?? 0],
+  ] as const) {
+    if (!extra || opening.width === width) continue
+    const sign = side * openingHostFacing(node)
+    const a = (sign * width) / 2
+    const b = sign * (width / 2 + extra)
+    children.push({
+      kind: 'polyline',
+      points: [
+        [cx + dirX * a, cz + dirZ * a],
+        [cx + dirX * b, cz + dirZ * b],
+      ],
+      fill: 'none',
+      stroke: accentColor,
+      strokeWidth: 2,
+      vectorEffect: 'non-scaling-stroke',
+    })
+  }
+
+  // Casing legs on the wall faces beside the cutout, as the 3D door has them.
+  const casing = buildOpeningCasingPlan(node, wall, {
+    fill: fillColor,
+    stroke: accentMuted,
+    strokeWidth: showSelectedChrome ? 1.4 : 1,
+    vectorEffect: 'non-scaling-stroke',
+  })
+  if (casing) children.push(casing)
+
+  if (node.openingShape !== 'rectangle') {
+    const overheadRise =
+      Math.min(width, node.openingShape === 'arch' ? node.archHeight : node.cornerRadius) * 0.2
+    const overheadSide = swingDirection === 'inward' ? 1 : -1
+    const startX = cx - dirX * halfWidth
+    const startZ = cz - dirZ * halfWidth
+    const endX = cx + dirX * halfWidth
+    const endZ = cz + dirZ * halfWidth
+    children.push({
+      kind: 'path',
+      d: `M ${startX} ${startZ} Q ${cx + perpX * overheadRise * overheadSide} ${cz + perpZ * overheadRise * overheadSide} ${endX} ${endZ}`,
+      fill: 'none',
+      stroke: accentColor,
+      strokeWidth: showSelectedChrome ? 1.4 : 1,
+      strokeOpacity: 0.8,
+      strokeDasharray: '4 3',
+      strokeLinecap: 'round',
+      vectorEffect: 'non-scaling-stroke',
+    })
+  }
 
   // Swing geometry. A leaf is drawn as a wedge fill + dashed swing arc +
   // solid leaf line. `drawSwingLeaf` emits one leaf given its hinge, the
@@ -187,6 +311,47 @@ export function buildDoorFloorplan(node: DoorNode, ctx: GeometryContext): Floorp
       strokeLinecap: 'round',
       vectorEffect: 'non-scaling-stroke',
     })
+
+    const markerSize = Math.min(0.05, Math.max(0.025, radius * 0.05))
+    const markerHalf = markerSize / 2
+    const hardwareMarkers: Array<[number, number]> = [
+      [hX, hZ],
+      [closedTipX, closedTipZ],
+    ]
+    for (const [markerX, markerZ] of hardwareMarkers) {
+      children.push({
+        kind: 'rect',
+        x: markerX - markerHalf,
+        y: markerZ - markerHalf,
+        width: markerSize,
+        height: markerSize,
+        fill: fillColor,
+        stroke: accentColor,
+        strokeWidth: showSelectedChrome ? 1.4 : 1,
+        vectorEffect: 'non-scaling-stroke',
+      })
+    }
+
+    if (node.panicBar) {
+      const leafX = (tipX - hX) / radius
+      const leafZ = (tipZ - hZ) / radius
+      const barCenterX = hX + leafX * radius * 0.7
+      const barCenterZ = hZ + leafZ * radius * 0.7
+      const barHalfLength = Math.min(0.12, Math.max(0.06, depth * 0.75))
+      const barX = -leafZ * barHalfLength
+      const barZ = leafX * barHalfLength
+      children.push({
+        kind: 'line',
+        x1: barCenterX - barX,
+        y1: barCenterZ - barZ,
+        x2: barCenterX + barX,
+        y2: barCenterZ + barZ,
+        stroke: accentColor,
+        strokeWidth: showSelectedChrome ? 2.6 : 2.2,
+        strokeLinecap: 'square',
+        vectorEffect: 'non-scaling-stroke',
+      })
+    }
   }
 
   const isDoubleLeaf = node.doorType === 'double' || node.doorType === 'french'
@@ -201,8 +366,9 @@ export function buildDoorFloorplan(node: DoorNode, ctx: GeometryContext): Floorp
   // fall through to just the opening footprint (the earlier behaviour).
   const isSwingDoor = node.doorType === 'hinged' || isDoubleLeaf
   // A frameless wall opening — drawn as a bare gap, no leaf / arc / panel
-  // (mirrors the 3D system, which renders only the cutout for openings).
-  const isOpening = node.openingKind === 'opening'
+  // (mirrors the 3D system, which renders only the cutout for openings). A
+  // door on a railing is always one: a gap in the guard.
+  const isOpening = node.openingKind === 'opening' || wall.wallType === 'railing'
 
   if (isOpening) {
     // Open doorway — a frameless gap in the wall. No leaf, arc, or panel;
@@ -216,7 +382,7 @@ export function buildDoorFloorplan(node: DoorNode, ctx: GeometryContext): Floorp
     // The fold span / depth are fixed so the plan symbol stays static
     // regardless of the live open state.
     const FOLD_SPAN_RATIO = 0.8
-    const panelCount = node.leafCount === 2 ? 2 : 4
+    const panelCount = node.leafCount >= 6 ? node.leafCount : node.leafCount === 2 ? 2 : 4
     const panelLen = (width * FOLD_SPAN_RATIO) / panelCount
     const peakDepth = panelLen * 0.7
     // Anchor the accordion's base line on the room-facing wall face (the
@@ -225,7 +391,12 @@ export function buildDoorFloorplan(node: DoorNode, ctx: GeometryContext): Floorp
     const baseOffX = perpX * halfDepth * swingSign
     const baseOffZ = perpZ * halfDepth * swingSign
     // Start at the hinge edge and step toward the opposite jamb.
-    const hingeTangentSign = hingesSide === 'left' ? 1 : -1
+    const hingeTangentSign =
+      panelCount > 4
+        ? (node.slideDirection === 'right' ? -1 : 1) * openingHostFacing(node)
+        : hingesSide === 'left'
+          ? 1
+          : -1
     const startX = cx - dirX * halfWidth * hingeTangentSign + baseOffX
     const startZ = cz - dirZ * halfWidth * hingeTangentSign + baseOffZ
     const stepX = dirX * panelLen * hingeTangentSign
@@ -259,7 +430,8 @@ export function buildDoorFloorplan(node: DoorNode, ctx: GeometryContext): Floorp
     // regardless of the live open state.
     const slideSign = node.slideDirection === 'right' ? 1 : -1
     const panelHalfThick = Math.min(depth * 0.22, 0.03)
-    const panelHalfLen = width * 0.275
+    const panelCount = Math.max(2, Math.min(4, node.leafCount))
+    const panelHalfLen = panelCount === 2 ? width * 0.275 : width / panelCount / 2 + 0.01
     const panelRect = (centerAlong: number, perpSign: number): [number, number][] => {
       const rcx = cx + dirX * centerAlong + perpX * panelHalfThick * perpSign
       const rcz = cz + dirZ * centerAlong + perpZ * panelHalfThick * perpSign
@@ -286,8 +458,17 @@ export function buildDoorFloorplan(node: DoorNode, ctx: GeometryContext): Floorp
       })
     // Left panel toward one face, right panel toward the other; they
     // overlap across the centre.
-    pushPanel(panelRect(-halfWidth + panelHalfLen, 1))
-    pushPanel(panelRect(halfWidth - panelHalfLen, -1))
+    for (let index = 0; index < panelCount; index++) {
+      const front =
+        node.slidingStyle === 'bypass'
+          ? index % 2 === (panelCount === 3 || slideSign < 0 ? 1 : 0)
+          : panelCount === 4
+            ? index === 1 || index === 2
+            : panelCount === 3
+              ? index === 1
+              : index === (slideSign < 0 ? 1 : 0)
+      pushPanel(panelRect(-halfWidth + (width * (index + 0.5)) / panelCount, front ? 1 : -1))
+    }
     // Slide-direction arrow, centred and pushed clear of the wall face
     // so it doesn't overlap the wall or panels.
     const arrowPerp = -(halfDepth + Math.max(panelHalfThick * 4, halfWidth * 0.22))
@@ -693,36 +874,71 @@ export function buildDoorFloorplan(node: DoorNode, ctx: GeometryContext): Floorp
     // direction). Pointer-down on either routes through the door's
     // `resize-width` affordance — anchored at the opposite edge, clamped
     // to wall bounds. Mirrors the 3D `DoorSideArrow` width drag.
-    const startEdgeX = cx - dirX * halfWidth
-    const startEdgeZ = cz - dirZ * halfWidth
-    const endEdgeX = cx + dirX * halfWidth
-    const endEdgeZ = cz + dirZ * halfWidth
-    children.push({
-      kind: 'move-arrow',
-      point: [startEdgeX, startEdgeZ],
-      angle: Math.atan2(-dirZ, -dirX),
-      affordance: 'resize-width',
-      payload: { side: 'start' },
-    })
-    children.push({
-      kind: 'move-arrow',
-      point: [endEdgeX, endEdgeZ],
-      angle: Math.atan2(dirZ, dirX),
-      affordance: 'resize-width',
-      payload: { side: 'end' },
-    })
+    // A scripted opening's width is its script's: its size arrows live in 3D, on its params.
+    if (!node.source) {
+      const startEdgeX = cx - dirX * halfWidth
+      const startEdgeZ = cz - dirZ * halfWidth
+      const endEdgeX = cx + dirX * halfWidth
+      const endEdgeZ = cz + dirZ * halfWidth
+      children.push({
+        kind: 'move-arrow',
+        point: [startEdgeX, startEdgeZ],
+        angle: Math.atan2(-dirZ, -dirX),
+        affordance: 'resize-width',
+        payload: { side: 'start' },
+      })
+      children.push({
+        kind: 'move-arrow',
+        point: [endEdgeX, endEdgeZ],
+        angle: Math.atan2(dirZ, dirX),
+        affordance: 'resize-width',
+        payload: { side: 'end' },
+      })
+    }
   }
 
   // Placement-measurement dimensions — distances to adjacent openings
   // (or wall ends) on each side. Only visible while actively moving
   // (the user clicked Move or grabbed the orange dot).
-  if (view?.moving) {
+  if (view?.moving && readFloorplanContext(ctx).automaticDimensions) {
     for (const dim of buildOpeningPlacementDimensions(node, ctx)) {
       children.push(dim)
     }
   }
 
-  return { kind: 'group', children }
+  const markAnnotation = buildOpeningMarkAnnotation(
+    node,
+    wall,
+    ctx.levelData as OpeningFloorplanLevelData | undefined,
+    {
+      preferredSide: swingSign === 1 ? -1 : 1,
+      stroke: showSelectedChrome ? '#f97316' : '#334155',
+      drafting: readFloorplanContext(ctx).drafting,
+    },
+  )
+  if (markAnnotation) children.push(markAnnotation)
+
+  return { kind: 'group', children: children.map(markDoorPlanObstacle) }
+}
+
+function markDoorPlanObstacle(geometry: FloorplanGeometry): FloorplanGeometry {
+  if (geometry.kind === 'group') {
+    const isOpeningMark = readFloorplanGeometryMetadata(geometry).annotationRole === 'opening-mark'
+    return isOpeningMark
+      ? geometry
+      : { ...geometry, children: geometry.children.map(markDoorPlanObstacle) }
+  }
+  if (
+    geometry.kind === 'path' ||
+    geometry.kind === 'polygon' ||
+    geometry.kind === 'polyline' ||
+    geometry.kind === 'rect' ||
+    geometry.kind === 'circle' ||
+    geometry.kind === 'line'
+  ) {
+    return withFloorplanGeometryMetadata(geometry, { annotationObstacle: 'bounds' })
+  }
+  return geometry
 }
 
 /**

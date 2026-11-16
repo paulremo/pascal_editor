@@ -1,8 +1,11 @@
 import type { FenceNode, WallNode } from '../../schema'
+import { getWallFaceOffsets } from './wall-frame'
 import type { Point2D } from './wall-mitering'
 
 const CURVE_EPSILON = 1e-6
 const DEFAULT_SAMPLE_SEGMENTS = 24
+const CURVE_INTERSECTION_SEARCH_STEPS = 20
+const CURVE_INTERSECTION_TOLERANCE = 1e-6
 
 type WallCurveLike = Pick<WallNode | FenceNode, 'start' | 'end' | 'curveOffset'>
 
@@ -106,7 +109,7 @@ export function getWallChordFrame(wall: WallCurveLike) {
   }
 }
 
-function getWallArcData(wall: WallCurveLike) {
+export function getWallArcData(wall: WallCurveLike) {
   const chord = getWallChordFrame(wall)
   const sagitta = getClampedWallCurveOffset(wall)
 
@@ -189,6 +192,109 @@ export function sampleWallCenterline(wall: WallCurveLike, segments = DEFAULT_SAM
   )
 }
 
+/**
+ * A wall's centreline as consecutive plan segments: its chord on a straight wall, the sampled
+ * arc's parts on a curved one.
+ */
+export function getWallCenterlineSegments(
+  wall: WallCurveLike,
+  segments = DEFAULT_SAMPLE_SEGMENTS,
+): [Point2D, Point2D][] {
+  if (!isCurvedWall(wall)) return [[getWallStartPoint(wall), getWallEndPoint(wall)]]
+  const points = sampleWallCenterline(wall, segments)
+  return points.slice(1).flatMap((end, index): [Point2D, Point2D][] => {
+    const start = points[index]
+    return start ? [[start, end]] : []
+  })
+}
+
+function segmentIntersectionPoint(a: Point2D, b: Point2D, c: Point2D, d: Point2D): Point2D | null {
+  const abX = b.x - a.x
+  const abY = b.y - a.y
+  const cdX = d.x - c.x
+  const cdY = d.y - c.y
+  const denominator = abX * cdY - abY * cdX
+  if (Math.abs(denominator) <= CURVE_INTERSECTION_TOLERANCE) return null
+
+  const acX = c.x - a.x
+  const acY = c.y - a.y
+  const t = (acX * cdY - acY * cdX) / denominator
+  const u = (acX * abY - acY * abX) / denominator
+  if (
+    t < -CURVE_INTERSECTION_TOLERANCE ||
+    t > 1 + CURVE_INTERSECTION_TOLERANCE ||
+    u < -CURVE_INTERSECTION_TOLERANCE ||
+    u > 1 + CURVE_INTERSECTION_TOLERANCE
+  ) {
+    return null
+  }
+
+  return { x: a.x + t * abX, y: a.y + t * abY }
+}
+
+function pointMatchesEndpoint(point: Point2D, wall: WallCurveLike) {
+  return [getWallStartPoint(wall), getWallEndPoint(wall)].some(
+    (endpoint) => distance(point, endpoint) <= CURVE_INTERSECTION_TOLERANCE,
+  )
+}
+
+function wallCurveIntersectsSibling(wall: WallNode, sibling: WallNode) {
+  const wallPoints = sampleWallCenterline(wall)
+  const siblingPoints = sampleWallCenterline(sibling)
+
+  for (let wallIndex = 0; wallIndex < wallPoints.length - 1; wallIndex += 1) {
+    const wallStart = wallPoints[wallIndex]!
+    const wallEnd = wallPoints[wallIndex + 1]!
+    for (let siblingIndex = 0; siblingIndex < siblingPoints.length - 1; siblingIndex += 1) {
+      const siblingStart = siblingPoints[siblingIndex]!
+      const siblingEnd = siblingPoints[siblingIndex + 1]!
+      const intersection = segmentIntersectionPoint(wallStart, wallEnd, siblingStart, siblingEnd)
+      if (!intersection) continue
+      if (pointMatchesEndpoint(intersection, wall) && pointMatchesEndpoint(intersection, sibling)) {
+        continue
+      }
+      return true
+    }
+  }
+
+  return false
+}
+
+function wallCurveIntersectsSiblings(wall: WallNode, walls: readonly WallNode[]) {
+  if (!isCurvedWall(wall)) return false
+  return walls.some(
+    (sibling) =>
+      sibling.id !== wall.id &&
+      sibling.parentId === wall.parentId &&
+      wallCurveIntersectsSibling(wall, sibling),
+  )
+}
+
+export function constrainWallCurveOffsetToAvoidIntersections(
+  wall: WallNode,
+  proposedOffset: number,
+  walls: readonly WallNode[],
+) {
+  const currentOffset = normalizeWallCurveOffset(wall, wall.curveOffset ?? 0)
+  const normalizedProposal = normalizeWallCurveOffset(wall, proposedOffset)
+  const proposedWall = { ...wall, curveOffset: normalizedProposal }
+  if (!wallCurveIntersectsSiblings(proposedWall, walls)) return normalizedProposal
+
+  const currentWall = { ...wall, curveOffset: currentOffset }
+  if (wallCurveIntersectsSiblings(currentWall, walls)) return currentOffset
+
+  let safeOffset = currentOffset
+  let blockedOffset = normalizedProposal
+  for (let index = 0; index < CURVE_INTERSECTION_SEARCH_STEPS; index += 1) {
+    const candidateOffset = (safeOffset + blockedOffset) / 2
+    const candidateWall = { ...wall, curveOffset: candidateOffset }
+    if (wallCurveIntersectsSiblings(candidateWall, walls)) blockedOffset = candidateOffset
+    else safeOffset = candidateOffset
+  }
+
+  return normalizeWallCurveOffset(wall, safeOffset)
+}
+
 export function getWallCurveLength(wall: WallCurveLike, segments = DEFAULT_SAMPLE_SEGMENTS) {
   const points = sampleWallCenterline(wall, segments)
   let totalLength = 0
@@ -200,12 +306,51 @@ export function getWallCurveLength(wall: WallCurveLike, segments = DEFAULT_SAMPL
   return totalLength
 }
 
+function chordFractionAtParam(wall: WallCurveLike, u: number) {
+  const chord = getWallChordFrame(wall)
+  const { point } = getWallCurveFrameAt(wall, u)
+  const dx = chord.end.x - chord.start.x
+  const dy = chord.end.y - chord.start.y
+  return clamp01(
+    ((point.x - chord.start.x) * dx + (point.y - chord.start.y) * dy) / chord.length ** 2,
+  )
+}
+
+/**
+ * Where arc-length `station` (m along the centreline, the frame openings are placed in) projects
+ * onto the chord, as a fraction of it: the frame the wall body is extruded and its top sloped in.
+ */
+export function getWallChordFractionAt(wall: WallCurveLike, station: number): number {
+  const chord = getWallChordLength(wall)
+  if (chord < CURVE_EPSILON) return 0
+  if (!isCurvedWall(wall)) return clamp01(station / chord)
+  return chordFractionAtParam(wall, station / getWallCurveLength(wall))
+}
+
+/**
+ * The arc-length station that projects onto chord `fraction`: the inverse of
+ * {@link getWallChordFractionAt}. A wall arc is at most a semicircle, so the projection only grows.
+ */
+export function getWallStationAtChordFraction(wall: WallCurveLike, fraction: number): number {
+  const chord = getWallChordLength(wall)
+  if (!isCurvedWall(wall) || chord < CURVE_EPSILON) return clamp01(fraction) * chord
+  let lo = 0
+  let hi = 1
+  for (let step = 0; step < 40; step += 1) {
+    const mid = (lo + hi) / 2
+    if (chordFractionAtParam(wall, mid) < fraction) lo = mid
+    else hi = mid
+  }
+  return ((lo + hi) / 2) * getWallCurveLength(wall)
+}
+
 export function getWallSurfacePolygon(
-  wall: Pick<WallNode | FenceNode, 'start' | 'end' | 'curveOffset' | 'thickness'>,
+  wall: Pick<WallNode | FenceNode, 'start' | 'end' | 'curveOffset' | 'thickness'> &
+    Pick<WallNode, 'justification'>,
   segments = DEFAULT_SAMPLE_SEGMENTS,
   miterOverrides?: WallSurfaceMiterOverrides,
 ) {
-  const halfThickness = (wall.thickness ?? 0.1) / 2
+  const { a, b } = getWallFaceOffsets(wall)
   const count = Math.max(1, segments)
   const left: Point2D[] = []
   const right: Point2D[] = []
@@ -213,12 +358,12 @@ export function getWallSurfacePolygon(
   for (let index = 0; index <= count; index += 1) {
     const frame = getWallCurveFrameAt(wall, index / count)
     left.push({
-      x: frame.point.x + frame.normal.x * halfThickness,
-      y: frame.point.y + frame.normal.y * halfThickness,
+      x: frame.point.x + frame.normal.x * a,
+      y: frame.point.y + frame.normal.y * a,
     })
     right.push({
-      x: frame.point.x - frame.normal.x * halfThickness,
-      y: frame.point.y - frame.normal.y * halfThickness,
+      x: frame.point.x - frame.normal.x * -b,
+      y: frame.point.y - frame.normal.y * -b,
     })
   }
 
@@ -230,4 +375,23 @@ export function getWallSurfacePolygon(
   }
 
   return [...right, ...left.reverse()]
+}
+
+export function getWallCurveStationAtPoint(
+  wall: WallCurveLike,
+  point: readonly [number, number],
+): number {
+  const arc = getWallArcData(wall)
+  if (!arc) {
+    const chord = getWallChordFrame(wall)
+    return clamp01(
+      ((point[0] - chord.start.x) * chord.tangent.x +
+        (point[1] - chord.start.y) * chord.tangent.y) /
+        chord.length,
+    )
+  }
+  let angle = Math.atan2(point[1] - arc.center.y, point[0] - arc.center.x) - arc.startAngle
+  if (arc.delta > 0 && angle < 0) angle += Math.PI * 2
+  if (arc.delta < 0 && angle > 0) angle -= Math.PI * 2
+  return clamp01(angle / arc.delta)
 }

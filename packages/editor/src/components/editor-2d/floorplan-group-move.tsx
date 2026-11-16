@@ -6,7 +6,9 @@ import {
   bboxCornerAnchors,
   collectAlignmentAnchors,
   DEFAULT_ANGLE_STEP,
+  type FloorplanGeometry,
   type FloorplanPalette,
+  formatLinearMeasurement,
   pauseSceneHistory,
   pauseSpaceDetection,
   resumeSceneHistory,
@@ -15,34 +17,44 @@ import {
   useLiveTransforms,
   useScene,
 } from '@pascal-app/core'
-import { useViewer } from '@pascal-app/viewer'
+import { isTypingTarget, useViewer } from '@pascal-app/viewer'
+import { FloorplanDimensionRenderer } from '@pascal-app/viewer/ui'
 import { memo, type PointerEvent as ReactPointerEvent, useEffect, useMemo, useState } from 'react'
 import { create } from 'zustand'
 import { GROUP_MOVE_DRAG_LABEL, GROUP_ROTATE_DRAG_LABEL } from '../../lib/contextual-help'
 import { applyFloorplanAlignment } from '../../lib/floorplan/apply-alignment'
 import { clientToPlan } from '../../lib/floorplan/plan-coords'
+import { isHistoryShortcut } from '../../lib/history'
+import type { WallGroupPush } from '../../lib/room-handle-drag'
+import { useRoomHandleDrag } from '../../lib/room-handle-drag'
 import { sfxEmitter } from '../../lib/sfx-bus'
 import useAlignmentGuides from '../../store/use-alignment-guides'
 import useEditor, {
   isAlignmentGuideActive,
+  isAngleSnapActive,
   isGridSnapActive,
   isMagneticSnapActive,
 } from '../../store/use-editor'
+import useFloorplanMode from '../../store/use-floorplan-mode'
 import useInteractionScope, { useMovingNode } from '../../store/use-interaction-scope'
 import {
+  beginGroupWallPush,
   classifyParticipant,
   collectParticipants,
-  computeGroupBox,
-  expandToComponent,
+  computeGroupPlanBox,
+  type GroupPlanBounds,
+  groupPlanBounds,
   levelFrame,
-  participantExtents,
+  planBoundsCenter,
   rotateGroupPatches,
   rotateGroupSnapshots,
+  rotatePlanBounds,
   translateGroupPatches,
   type Vec2,
 } from '../editor/group-transform-shared'
 import { swallowNextClick } from '../editor/handles/use-handle-drag'
 import { useMeshSettleEpoch } from '../editor/use-mesh-settle-epoch'
+import { useFloorplanSceneRotation } from './floorplan-render-context'
 
 // 2D sibling of the 3D body-drag group move (`group-move-3d.ts`): dragging
 // any selected element of a multi-selection slides the whole selection
@@ -105,8 +117,13 @@ export function startFloorplanGroupMove(
     affectedIds: AnyNodeId[]
     candidates: ReturnType<typeof collectAlignmentAnchors>
     restAnchors: ReturnType<typeof bboxCornerAnchors>
+    startBounds: GroupPlanBounds
+    restBounds: GroupPlanBounds
+    rotation: number
     restCenter: Vec2
     lastDelta: Vec2 | null
+    /** Walls alone: each moves as its push arrow does instead of the rigid slide. */
+    push: WallGroupPush | null
   }
   let session: Session | null = null
 
@@ -115,9 +132,8 @@ export function startFloorplanGroupMove(
     const participantIds = selectedIds.filter(
       (id) => classifyParticipant(nodes[id as AnyNodeId], levelId, nodes) !== null,
     )
-    // Move the full connected wall/fence component, mirroring the 3D gizmo.
-    const fullIds = expandToComponent(participantIds, nodes, levelId)
-    const { starts, links } = collectParticipants(fullIds, nodes, levelId)
+    // Only the selection moves; connected walls stretch through `links`, as in 3D.
+    const { starts, links } = collectParticipants(participantIds, nodes, levelId)
     if (starts.length === 0) return null
     const affectedIds: AnyNodeId[] = [...starts.map((s) => s.id), ...links.map((l) => l.id)]
 
@@ -131,22 +147,17 @@ export function startFloorplanGroupMove(
     const candidates = collectAlignmentAnchors(staticNodes, '', levelId)
 
     // The group aligns as one rigid footprint: its bbox corners + center are
-    // the moving anchors. `computeGroupBox` is world-space (the 3D scene stays
-    // mounted under every view mode); plan coords are level-frame, so convert.
-    const restBox = computeGroupBox(fullIds)
+    // the moving anchors, measured in the level frame like the plan itself.
     const { inverse: frameInv } = levelFrame(levelId)
-    const boxMin = restBox ? restBox.min.clone().applyMatrix4(frameInv) : null
-    const boxMax = restBox ? restBox.max.clone().applyMatrix4(frameInv) : null
-    const restAnchors =
-      boxMin && boxMax
-        ? bboxCornerAnchors(
-            'group-move',
-            Math.min(boxMin.x, boxMax.x),
-            Math.min(boxMin.z, boxMax.z),
-            Math.max(boxMin.x, boxMax.x),
-            Math.max(boxMin.z, boxMax.z),
-          )
-        : []
+    const restBounds = groupPlanBounds(starts, frameInv)
+    if (!restBounds) return null
+    const restAnchors = bboxCornerAnchors(
+      'group-move',
+      restBounds.minX,
+      restBounds.minZ,
+      restBounds.maxX,
+      restBounds.maxZ,
+    )
 
     for (const id of affectedIds) {
       useLiveTransforms.getState().clear(id)
@@ -162,12 +173,24 @@ export function startFloorplanGroupMove(
       nodeId,
       handle: GROUP_MOVE_DRAG_LABEL,
     })
-    // Rotation pivot for mid-drag R/T — the participant DATA extents' center
-    // (stable across the drag; rotations re-seed around the same point).
-    const ext = participantExtents(starts)
-    const restCenter: Vec2 = ext ? [(ext.minX + ext.maxX) / 2, (ext.minZ + ext.maxZ) / 2] : [0, 0]
+    // Rotation pivot for mid-drag R/T — the START footprint's center, the same
+    // point the 3D body drag, the idle keyboard rotate and the rotate gizmos
+    // orbit. Stable across the drag; rotations re-seed around the same point.
+    const restCenter = planBoundsCenter(restBounds)
 
-    return { starts, links, affectedIds, candidates, restAnchors, restCenter, lastDelta: null }
+    return {
+      starts,
+      links,
+      affectedIds,
+      candidates,
+      restAnchors,
+      startBounds: restBounds,
+      restBounds,
+      rotation: 0,
+      restCenter,
+      lastDelta: null,
+      push: beginGroupWallPush(starts, levelId),
+    }
   }
 
   const applyMove = (e: PointerEvent, s: Session) => {
@@ -183,8 +206,14 @@ export function startFloorplanGroupMove(
     let dz = snap ? Math.round((plan[1] - startPlan[1]) / step) * step : plan[1] - startPlan[1]
 
     // Figma-style alignment layered on top: guides display in every mode
-    // except Off; the magnetic pull applies only in 'lines' mode.
-    if (isAlignmentGuideActive() && s.candidates.length > 0 && s.restAnchors.length > 0) {
+    // except Off; the magnetic pull applies only in 'lines' mode. Pushed walls
+    // don't move as one footprint, so they have no box to align.
+    if (
+      !s.push &&
+      isAlignmentGuideActive() &&
+      s.candidates.length > 0 &&
+      s.restAnchors.length > 0
+    ) {
       const proposed: [number, number] = [startPlan[0] + dx, startPlan[1] + dz]
       const aligned = applyFloorplanAlignment(
         proposed,
@@ -206,6 +235,10 @@ export function startFloorplanGroupMove(
     if (!s.lastDelta || s.lastDelta[0] !== dx || s.lastDelta[1] !== dz) {
       sfxEmitter.emit('sfx:grid-snap')
       s.lastDelta = [dx, dz]
+    }
+    if (s.push) {
+      s.push.preview([dx, dz])
+      return
     }
 
     const entries = translateGroupPatches(s.starts, s.links, dx, dz)
@@ -234,23 +267,28 @@ export function startFloorplanGroupMove(
   // current delta — the carried group turns exactly like the idle keyboard
   // rotate, and the commit stays a single updateNodes.
   const rotateSession = (s: Session, direction: 1 | -1) => {
-    const rotated = rotateGroupSnapshots(
-      s.starts,
-      s.links,
-      { x: s.restCenter[0], z: s.restCenter[1] },
-      -direction * (Math.PI / 4),
-    )
+    // Pushed walls keep their bearing: there is nothing to turn.
+    if (s.push) return
+    const pivot = { x: s.restCenter[0], z: s.restCenter[1] }
+    const delta = -direction * (Math.PI / 4)
+    const rotated = rotateGroupSnapshots(s.starts, s.links, pivot, delta)
     s.starts = rotated.starts
     s.links = rotated.links
-    const ext = participantExtents(rotated.starts)
-    if (ext) {
-      s.restAnchors = bboxCornerAnchors('group-move', ext.minX, ext.minZ, ext.maxX, ext.maxZ)
-    }
+    s.rotation += delta
+    s.restBounds = rotatePlanBounds(s.startBounds, pivot, s.rotation)
+    s.restAnchors = bboxCornerAnchors(
+      'group-move',
+      s.restBounds.minX,
+      s.restBounds.minZ,
+      s.restBounds.maxX,
+      s.restBounds.maxZ,
+    )
     sfxEmitter.emit('sfx:item-rotate')
     applyDelta(s, s.lastDelta?.[0] ?? 0, s.lastDelta?.[1] ?? 0)
   }
 
   const clearLivePreviews = (s: Session) => {
+    s.push?.cancel()
     const overrides = useLiveNodeOverrides.getState()
     const liveTransforms = useLiveTransforms.getState()
     for (const id of s.affectedIds) {
@@ -310,6 +348,13 @@ export function startFloorplanGroupMove(
     // doesn't clear the multi-selection the drag is preserving.
     swallowNextClick()
     sfxEmitter.emit('sfx:item-place')
+    if (session.push) {
+      resumeSceneHistory(useScene)
+      session.push.commit()
+      session = null
+      teardown()
+      return
+    }
     const overrides = useLiveNodeOverrides.getState()
     const updates: { id: AnyNodeId; data: Partial<AnyNode> }[] = []
     for (const id of session.affectedIds) {
@@ -349,9 +394,25 @@ export function startFloorplanGroupMove(
   // Escape arm (registered earlier on window in the bubble phase), which
   // would otherwise clear the multi-selection mid-cancel.
   const onKeyDown = (e: KeyboardEvent) => {
+    if (isTypingTarget(e.target)) return
     const key = e.key.toLowerCase()
     if ((key === 'r' || key === 't') && !e.metaKey && !e.ctrlKey && !e.altKey && !e.shiftKey) {
-      if (!session) return
+      // Armed but still under the drag threshold: engage first (exactly what
+      // the next pointer-move would do) so the rotation lands inside this
+      // session. Falling through to the global idle arm instead would write
+      // the scene behind snapshots already captured here, and the first
+      // `applyDelta` would republish them — undoing the rotation.
+      if (!session) {
+        session = engage()
+        if (!session) {
+          // No plane hit yet: swallow the chord and keep the gesture armed so
+          // the next pointer-move can still engage; the idle arm must not run
+          // behind the snapshots captured here.
+          e.preventDefault()
+          e.stopPropagation()
+          return
+        }
+      }
       e.preventDefault()
       e.stopPropagation()
       rotateSession(session, key === 'r' ? 1 : -1)
@@ -363,7 +424,8 @@ export function startFloorplanGroupMove(
       cancel()
       return
     }
-    if (e.key !== 'Escape') return
+    // ⌘Z mid-gesture cancels like Escape — never a history jump under a live pointer.
+    if (e.key !== 'Escape' && !isHistoryShortcut(e)) return
     e.preventDefault()
     e.stopPropagation()
     swallowNextClick()
@@ -403,13 +465,16 @@ export function startFloorplanGroupRotate(event: {
     (id) => classifyParticipant(nodes[id as AnyNodeId], levelId, nodes) !== null,
   )
   if (participantIds.length === 0) return false
-  const fullIds = expandToComponent(participantIds, nodes, levelId)
-  const { starts, links } = collectParticipants(fullIds, nodes, levelId)
+  const { starts, links } = collectParticipants(participantIds, nodes, levelId)
   if (starts.length === 0) return false
   const affectedIds: AnyNodeId[] = [...starts.map((s) => s.id), ...links.map((l) => l.id)]
-  const ext = participantExtents(starts)
-  if (!ext) return false
-  const pivot = { x: (ext.minX + ext.maxX) / 2, z: (ext.minZ + ext.maxZ) / 2 }
+  const { inverse: frameInv } = levelFrame(levelId)
+  const bounds = groupPlanBounds(starts, frameInv)
+  if (!bounds) return false
+  // Same pivot as the dashed box the handles hang off (and as the 3D rotate
+  // gizmo): its centre, not the anchor points' centre.
+  const [pivotX, pivotZ] = planBoundsCenter(bounds)
+  const pivot = { x: pivotX, z: pivotZ }
   const startPlan = clientToPlan(event.clientX, event.clientY)
   if (!startPlan) return false
   // Bearing around the pivot in the plan frame — the same atan2 x→z sense
@@ -439,9 +504,9 @@ export function startFloorplanGroupRotate(event: {
     let delta = angleOf([plan[0], plan[1]]) - initialAngle
     while (delta > Math.PI) delta -= 2 * Math.PI
     while (delta < -Math.PI) delta += 2 * Math.PI
-    // 15° increments by default; Shift rotates freely — the same contract
-    // as the 3D group rotate gizmo (and the HUD hint its scope surfaces).
-    if (!e.shiftKey) delta = Math.round(delta / DEFAULT_ANGLE_STEP) * DEFAULT_ANGLE_STEP
+    if (isAngleSnapActive()) {
+      delta = Math.round(delta / DEFAULT_ANGLE_STEP) * DEFAULT_ANGLE_STEP
+    }
 
     const entries = rotateGroupPatches(starts, links, pivot, delta)
     const patchById = new Map(entries)
@@ -531,12 +596,14 @@ export function startFloorplanGroupRotate(event: {
 
   // Capture phase so Escape wins over the global `use-keyboard` arm.
   const onKeyDown = (e: KeyboardEvent) => {
+    if (isTypingTarget(e.target)) return
     if (e.key === 'Delete' || e.key === 'Backspace') {
       // Deleting mid-rotate: revert first, then let the global Delete arm run.
       cancel()
       return
     }
-    if (e.key !== 'Escape') return
+    // ⌘Z mid-gesture cancels like Escape — never a history jump under a live pointer.
+    if (e.key !== 'Escape' && !isHistoryShortcut(e)) return
     e.preventDefault()
     e.stopPropagation()
     swallowNextClick()
@@ -562,8 +629,9 @@ const GROUP_BOX_ROTATE_CURSOR_STYLE = {
 
 /**
  * Dashed bounding box around the current multi-selection's transformable
- * participants (expanded to the welded wall/fence component) — shows what a
- * group drag will carry along, and IS the group's drag handle: press anywhere
+ * participants — what a group drag carries (connected walls outside the
+ * selection stretch at their shared ends to stay joined) — and IS the group's
+ * drag handle: press anywhere
  * inside it to slide the group, click to pick it up. Holding a selection
  * modifier (Cmd/Ctrl/Shift) lets pointer events pass through so members under
  * the box can still be toggled in and out. Rides the live drag delta so it
@@ -583,11 +651,17 @@ export const FloorplanGroupSelectionBox = memo(function FloorplanGroupSelectionB
 }) {
   const selectedIds = useViewer((s) => s.selection.selectedIds)
   const levelId = useViewer((s) => s.selection.levelId)
+  const unit = useViewer((s) => s.unit)
+  const metricNotation = useViewer((s) => s.metricNotation)
   const nodes = useScene((s) => s.nodes)
   const delta = useFloorplanGroupDrag((s) => s.delta)
   const liveRotation = useFloorplanGroupDrag((s) => s.rotation)
   const movingNode = useMovingNode()
+  // Pushed walls don't move as one box: the room widths they show take its place.
+  const wallPush = useRoomHandleDrag((s) => s.drag?.kind === 'wall-group-push')
   const mode = useEditor((s) => s.mode)
+  const floorplanMode = useFloorplanMode((s) => s.mode)
+  const sceneRotationDeg = useFloorplanSceneRotation()
 
   // While a selection modifier is held the box steps aside so clicks reach
   // the entries underneath (toggle membership) instead of starting a drag.
@@ -606,35 +680,52 @@ export const FloorplanGroupSelectionBox = memo(function FloorplanGroupSelectionB
   }, [])
 
   // `meshEpoch` re-runs the measurement once the meshes settle after a scene
-  // change (undo/redo included) — `computeGroupBox` reads mesh world bounds,
+  // change (undo/redo included) — `computeGroupPlanBox` reads mesh bounds,
   // which lag the `nodes` commit by a frame or two.
   const meshEpoch = useMeshSettleEpoch(nodes)
   const box = useMemo(() => {
+    void meshEpoch
     if (selectedIds.length < 2 || !levelId) return null
     const participantIds = selectedIds.filter(
       (id) => classifyParticipant(nodes[id as AnyNodeId], levelId, nodes) !== null,
     )
     if (participantIds.length === 0) return null
-    const fullIds = expandToComponent(participantIds, nodes, levelId)
-    const world = computeGroupBox(fullIds)
-    if (!world) return null
-    const { inverse } = levelFrame(levelId)
-    const min = world.min.clone().applyMatrix4(inverse)
-    const max = world.max.clone().applyMatrix4(inverse)
+    const plan = computeGroupPlanBox(participantIds, levelId)
+    if (!plan) return null
     return {
-      x: Math.min(min.x, max.x),
-      z: Math.min(min.z, max.z),
-      width: Math.abs(max.x - min.x),
-      depth: Math.abs(max.z - min.z),
+      x: plan.minX,
+      z: plan.minZ,
+      width: plan.maxX - plan.minX,
+      depth: plan.maxZ - plan.minZ,
     }
-    // biome-ignore lint/correctness/useExhaustiveDependencies: meshEpoch re-measures settled meshes
   }, [selectedIds, levelId, nodes, meshEpoch])
 
-  if (!box || movingNode || mode === 'delete') return null
+  if (!box || movingNode || wallPush || mode === 'delete') return null
 
   const pad = 6 * unitsPerPixel
   const stroke = palette?.selectedStroke ?? '#3b82f6'
   const interactive = !modifierHeld && !!onPointerDown
+  const dimensionOffset = pad + 0.28
+  const widthDimension = {
+    kind: 'dimension',
+    start: [box.x, box.z + box.depth],
+    end: [box.x + box.width, box.z + box.depth],
+    offsetNormal: [0, 1],
+    offsetDistance: dimensionOffset,
+    extensionOvershoot: 0.08,
+    text: formatLinearMeasurement(box.width, unit, metricNotation),
+    stroke,
+  } satisfies Extract<FloorplanGeometry, { kind: 'dimension' }>
+  const depthDimension = {
+    kind: 'dimension',
+    start: [box.x + box.width, box.z],
+    end: [box.x + box.width, box.z + box.depth],
+    offsetNormal: [1, 0],
+    offsetDistance: dimensionOffset,
+    extensionOvershoot: 0.08,
+    text: formatLinearMeasurement(box.depth, unit, metricNotation),
+    stroke,
+  } satisfies Extract<FloorplanGeometry, { kind: 'dimension' }>
   // Mid-gesture the box rides the live delta (group move) or spins around the
   // rotation pivot (corner rotate) — SVG rotate() is degrees around a plan
   // point, and positive matches the atan2 x→z sense on the y-down plan.
@@ -661,6 +752,18 @@ export const FloorplanGroupSelectionBox = memo(function FloorplanGroupSelectionB
         x={box.x - pad}
         y={box.z - pad}
       />
+      {floorplanMode === 'default' ? (
+        <g pointerEvents="none">
+          <FloorplanDimensionRenderer
+            geometry={widthDimension}
+            sceneRotationDeg={sceneRotationDeg}
+          />
+          <FloorplanDimensionRenderer
+            geometry={depthDimension}
+            sceneRotationDeg={sceneRotationDeg}
+          />
+        </g>
+      ) : null}
       {/* Corner rotate handles — the 2D counterpart of the 3D rotate gizmo:
           drag a corner to spin the group (15° steps, Shift = free). */}
       {interactive && onRotatePointerDown

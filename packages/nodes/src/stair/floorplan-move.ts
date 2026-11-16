@@ -3,12 +3,21 @@ import {
   collectAlignmentAnchors,
   type FloorplanMoveTarget,
   type FloorplanMoveTargetSession,
+  getFloorStackedPosition,
   movingAlignmentAnchors,
+  resolveStairSurfaceSnap,
   type StairNode,
+  type StairSegmentNode,
+  type StairSurfaceSnap,
   snapScalar,
-  useScene,
+  useLiveNodeOverrides,
 } from '@pascal-app/core'
-import { applyFloorplanAlignment, getSegmentGridStep } from '@pascal-app/editor'
+import {
+  applyFloorplanAlignment,
+  getSegmentGridStep,
+  isGridSnapActive,
+  isMagneticSnapActive,
+} from '@pascal-app/editor'
 import { createFloorplanCursorResolver } from '../shared/floorplan-cursor'
 
 /**
@@ -17,15 +26,20 @@ import { createFloorplanCursorResolver } from '../shared/floorplan-cursor'
  * Existing stairs preserve the cursor grab offset, matching the 3D move
  * tools; fresh catalog placement follows the cursor absolutely.
  *
- * Figma alignment is layered on the stair footprint edges; Alt bypasses.
+ * Figma alignment is layered on the stair footprint edges.
  * Guides are cleared by `FloorplanRegistryMoveOverlay`'s Path 1 teardown.
  *
- * The position is written straight to scene each tick (the stair has a real
- * `position` field, unlike polygon kinds) and re-applied atomically via
- * `commit()` so the overlay's deterministic revert → resume → commit path
- * records a single undo step (same pattern door / window use).
+ * The position previews through the live override store and is written to
+ * scene once via `commit()`.
  */
-export const stairFloorplanMoveTarget: FloorplanMoveTarget<StairNode> = ({ node, nodes }) => {
+export const stairFloorplanMoveTarget: FloorplanMoveTarget<StairNode> = ({
+  node: picked,
+  nodes,
+  sceneApi,
+}) => {
+  // The stair as the scene holds it now: a surface it sits on may have re-hosted it since
+  // it was picked up.
+  const node = (nodes[picked.id] as StairNode | undefined) ?? picked
   const startY = node.position[1]
   const resolveCursor = createFloorplanCursorResolver({
     original: [node.position[0], node.position[2]],
@@ -33,18 +47,23 @@ export const stairFloorplanMoveTarget: FloorplanMoveTarget<StairNode> = ({ node,
   })
   // Alignment candidates gathered once — the scene is stable during the drag.
   const candidates = collectAlignmentAnchors(nodes, node.id)
-  let lastValid: { position: [number, number, number] } | null = null
+  let lastValid: { position: [number, number, number]; rotation?: number } | null = null
+  const flight = node.children
+    .map((id) => nodes[id])
+    .find(
+      (child): child is StairSegmentNode =>
+        child?.type === 'stair-segment' && child.segmentType === 'stair',
+    )
+  let surfaceSnap: StairSurfaceSnap | null = null
 
   const session: FloorplanMoveTargetSession = {
-    affectedIds: [node.id as AnyNodeId],
-    apply({ planPoint, modifiers }) {
-      // Snap the origin to the editor's current grid step (driven by
-      // `useEditor.gridSnapStep`). Shift bypasses the grid snap.
-      const step = getSegmentGridStep()
-      const snap = (value: number) => (modifiers.shiftKey ? value : snapScalar(value, step))
+    affectedIds: flight ? [node.id as AnyNodeId, flight.id as AnyNodeId] : [node.id as AnyNodeId],
+    apply({ planPoint }) {
+      const step = isGridSnapActive() ? getSegmentGridStep() : 0
+      const snap = (value: number) => (step > 0 ? snapScalar(value, step) : value)
       const [gx, gz] = resolveCursor(planPoint, { snap })
-      // Figma alignment on the actual stair footprint (Alt bypasses alignment; Shift all snap),
-      // matching the 3D move tool. Publishes guides via `useAlignmentGuides`.
+      // Figma alignment on the actual stair footprint, matching the 3D move
+      // tool. Publishes guides via `useAlignmentGuides`.
       const movingAnchors = movingAlignmentAnchors(node, nodes, gx, gz, node.rotation ?? 0)
       const { point: aligned } = applyFloorplanAlignment(
         [gx, gz],
@@ -52,27 +71,108 @@ export const stairFloorplanMoveTarget: FloorplanMoveTarget<StairNode> = ({ node,
           ? movingAnchors
           : [{ nodeId: node.id, kind: 'corner', x: gx, z: gz }],
         candidates,
-        { bypass: modifiers.altKey || modifiers.shiftKey },
+        { applySnap: isMagneticSnapActive() },
       )
       const sx = aligned[0]
       const sz = aligned[1]
 
-      if (lastValid && lastValid.position[0] === sx && lastValid.position[2] === sz) return
-      lastValid = { position: [sx, startY, sz] }
-      useScene.getState().updateNodes([{ id: node.id as AnyNodeId, data: lastValid }])
+      const sceneNodes = sceneApi?.nodes() ?? nodes
+      const baseElevation = getFloorStackedPosition({
+        node,
+        nodes: sceneNodes,
+        position: [sx, startY, sz],
+        rotation: node.rotation,
+        levelId: node.parentId,
+      })[1]
+      surfaceSnap = !isMagneticSnapActive()
+        ? null
+        : resolveStairSurfaceSnap(
+            node,
+            sceneNodes,
+            [sx, startY, sz],
+            flight?.length ?? 3,
+            baseElevation,
+            sceneApi?.installedPlugins?.(),
+          )
+      const position = surfaceSnap?.position ?? ([sx, startY, sz] as [number, number, number])
+      if (
+        lastValid &&
+        lastValid.position[0] === position[0] &&
+        lastValid.position[2] === position[2] &&
+        lastValid.rotation === surfaceSnap?.rotation
+      )
+        return
+      lastValid = { position, ...(surfaceSnap ? { rotation: surfaceSnap.rotation } : {}) }
+      if (!surfaceSnap) useLiveNodeOverrides.getState().clear(node.id as AnyNodeId)
+      useLiveNodeOverrides.getState().set(node.id as AnyNodeId, {
+        ...lastValid,
+        ...(surfaceSnap
+          ? {
+              totalRise: surfaceSnap.totalRise,
+              stepCount: surfaceSnap.stepCount,
+              destinationSurfaceId: surfaceSnap.surfaceId,
+              railingMode: 'none' as const,
+            }
+          : { destinationSurfaceId: undefined }),
+      })
+      if (flight) {
+        if (surfaceSnap)
+          useLiveNodeOverrides.getState().set(flight.id as AnyNodeId, {
+            height: surfaceSnap.totalRise,
+            length: surfaceSnap.length,
+            stepCount: surfaceSnap.stepCount,
+          })
+        else useLiveNodeOverrides.getState().clear(flight.id as AnyNodeId)
+      }
+      sceneApi?.markDirty(node.id as AnyNodeId)
+      if (flight) sceneApi?.markDirty(flight.id as AnyNodeId)
     },
     canCommit() {
       // No overlap / placement rules for stairs in 2D — any pointer-up
       // position commits, as long as we actually moved. Mirrors the 3D
       // move tool which also lets stairs land anywhere on the slab.
-      return lastValid !== null
+      return lastValid !== null && Boolean(sceneApi?.applyChanges)
     },
     commit() {
       // Own the atomic write so the overlay takes the deterministic
       // commit-path (revert → resume → session.commit()). Same pattern
       // door / window use.
       if (!lastValid) return
-      useScene.getState().updateNodes([{ id: node.id as AnyNodeId, data: lastValid }])
+      useLiveNodeOverrides.getState().clear(node.id as AnyNodeId)
+      if (flight) useLiveNodeOverrides.getState().clear(flight.id as AnyNodeId)
+      sceneApi?.applyChanges?.({
+        update: [
+          {
+            id: node.id as AnyNodeId,
+            data: {
+              ...lastValid,
+              ...(surfaceSnap
+                ? {
+                    totalRise: surfaceSnap.totalRise,
+                    stepCount: surfaceSnap.stepCount,
+                    slabOpeningMode: 'none' as const,
+                    destinationSurfaceId: surfaceSnap.surfaceId,
+                    railingMode: 'none' as const,
+                  }
+                : node.destinationSurfaceId
+                  ? { destinationSurfaceId: undefined }
+                  : {}),
+            },
+          },
+          ...(surfaceSnap && flight
+            ? [
+                {
+                  id: flight.id as AnyNodeId,
+                  data: {
+                    height: surfaceSnap.totalRise,
+                    length: surfaceSnap.length,
+                    stepCount: surfaceSnap.stepCount,
+                  },
+                },
+              ]
+            : []),
+        ],
+      })
     },
   }
 

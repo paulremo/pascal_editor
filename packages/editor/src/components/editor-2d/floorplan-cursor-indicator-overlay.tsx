@@ -1,15 +1,17 @@
 'use client'
 
 import { Icon } from '@iconify/react'
-import { memo, useMemo } from 'react'
+import { memo, useLayoutEffect, useMemo, useRef, useState } from 'react'
+import { wallCursorIcon } from '../../lib/tool-cursor-icon'
 import useEditor, { type FloorplanSelectionTool } from '../../store/use-editor'
+import { useFloorplanDraftPreview } from '../../store/use-floorplan-draft-preview'
 import { furnishTools } from '../ui/action-menu/furnish-tools'
 import { tools as structureTools } from '../ui/action-menu/structure-tools'
-
-type SvgPoint = {
-  x: number
-  y: number
-}
+import {
+  type FloorplanCursorPoint,
+  projectFloorplanCursorPoint,
+  resolveFloorplanCursorIndicatorPosition,
+} from './floorplan-cursor-indicator-position'
 
 type FloorplanCursorIndicator =
   | {
@@ -22,7 +24,7 @@ type FloorplanCursorIndicator =
     }
 
 type FloorplanCursorIndicatorOverlayProps = {
-  cursorPosition: SvgPoint | null
+  cursorPosition: FloorplanCursorPoint | null
   floorplanSelectionTool: FloorplanSelectionTool
   movingOpeningType: 'door' | 'window' | null
   isPanning: boolean
@@ -44,8 +46,12 @@ export const FloorplanCursorIndicatorOverlay = memo(function FloorplanCursorIndi
 }: FloorplanCursorIndicatorOverlayProps) {
   const mode = useEditor((state) => state.mode)
   const tool = useEditor((state) => state.tool)
-  const structureLayer = useEditor((state) => state.structureLayer)
   const catalogCategory = useEditor((state) => state.catalogCategory)
+  const wallMode = useEditor((state) => state.continuationByContext.wall)
+  const cursorPoint = useFloorplanDraftPreview((state) => state.cursorPoint)
+  const anchorRef = useRef<HTMLDivElement>(null)
+  const [projectedCursorPosition, setProjectedCursorPosition] =
+    useState<FloorplanCursorPoint | null>(null)
 
   const activeFloorplanToolConfig = useMemo(() => {
     if (movingOpeningType) {
@@ -60,15 +66,18 @@ export const FloorplanCursorIndicatorOverlay = memo(function FloorplanCursorIndi
       return furnishTools.find((entry) => entry.catalogCategory === catalogCategory) ?? null
     }
 
+    // The wall shows its Rooms variant, like the 3D cursor bubble.
+    if (tool === 'wall') return wallCursorIcon(wallMode)
+
     return structureTools.find((entry) => entry.id === tool) ?? null
-  }, [catalogCategory, mode, movingOpeningType, tool])
+  }, [catalogCategory, mode, movingOpeningType, tool, wallMode])
 
   const indicator = useMemo<FloorplanCursorIndicator | null>(() => {
     if (activeFloorplanToolConfig) {
       return { kind: 'asset', iconSrc: activeFloorplanToolConfig.iconSrc }
     }
 
-    if (mode === 'select' && floorplanSelectionTool === 'marquee' && structureLayer !== 'zones') {
+    if (mode === 'select' && floorplanSelectionTool === 'marquee') {
       return { kind: 'icon', icon: 'mdi:select-drag' }
     }
 
@@ -81,9 +90,34 @@ export const FloorplanCursorIndicatorOverlay = memo(function FloorplanCursorIndi
     }
 
     return null
-  }, [activeFloorplanToolConfig, floorplanSelectionTool, mode, structureLayer])
+  }, [activeFloorplanToolConfig, floorplanSelectionTool, mode])
 
-  const position = cursorPosition
+  useLayoutEffect(() => {
+    const anchor = anchorRef.current
+    const overlayHost = anchor?.parentElement
+    const scene = overlayHost?.querySelector<SVGGElement>('[data-floorplan-scene]')
+    const sceneToViewport = scene?.getScreenCTM()
+
+    if (!(cursorPoint && cursorPosition && overlayHost && sceneToViewport)) {
+      setProjectedCursorPosition(null)
+      return
+    }
+
+    const overlayRect = overlayHost.getBoundingClientRect()
+    const nextPosition = projectFloorplanCursorPoint(cursorPoint, sceneToViewport, {
+      x: overlayRect.left,
+      y: overlayRect.top,
+    })
+    setProjectedCursorPosition((currentPosition) =>
+      currentPosition &&
+      currentPosition.x === nextPosition.x &&
+      currentPosition.y === nextPosition.y
+        ? currentPosition
+        : nextPosition,
+    )
+  }, [cursorPoint, cursorPosition])
+
+  const position = resolveFloorplanCursorIndicatorPosition(cursorPosition, projectedCursorPosition)
 
   if (!(indicator && position) || isPanning) {
     return null
@@ -93,6 +127,7 @@ export const FloorplanCursorIndicatorOverlay = memo(function FloorplanCursorIndi
     <div
       aria-hidden="true"
       className="pointer-events-none absolute z-20"
+      ref={anchorRef}
       style={{ left: position.x, top: position.y }}
     >
       {mode === 'delete' ? (

@@ -6,7 +6,7 @@ import { PanelLeftIcon } from 'lucide-react'
 import * as React from 'react'
 import { create } from 'zustand'
 import { persist } from 'zustand/middleware'
-import { Button } from './../../../components/ui/primitives/button'
+import { Button } from '@pascal-app/viewer/ui'
 import { Input } from './../../../components/ui/primitives/input'
 import { Separator } from './../../../components/ui/primitives/separator'
 import {
@@ -22,8 +22,9 @@ import {
   TooltipContent,
   TooltipProvider,
   TooltipTrigger,
-} from './../../../components/ui/primitives/tooltip'
-import { useIsMobile } from './../../../hooks/use-mobile'
+} from '@pascal-app/viewer/ui'
+import { useIsMobile } from '@pascal-app/viewer/ui'
+import { hydrationGatedStorage } from './../../../lib/hydration-gated-storage'
 import { cn } from './../../../lib/utils'
 
 const SIDEBAR_COOKIE_NAME = 'sidebar_state'
@@ -42,12 +43,18 @@ type SidebarStore = {
   setIsCollapsed: (collapsed: boolean) => void
   isDragging: boolean
   setIsDragging: (isDragging: boolean) => void
+  /** Width of the v2 layout's chat column. */
+  chatWidth: number
+  setChatWidth: (width: number) => void
+  /** The v2 layout's side menu is hidden, leaving a Menu button above the stage. */
+  isMenuHidden: boolean
+  setIsMenuHidden: (hidden: boolean) => void
 }
 
 export const useSidebarStore = create<SidebarStore>()(
   persist(
     (set) => ({
-      width: 288, // 18rem = 288px
+      width: 360,
       setWidth: (width) => {
         if (width < SIDEBAR_COLLAPSE_THRESHOLD) {
           set({ isCollapsed: true })
@@ -59,10 +66,20 @@ export const useSidebarStore = create<SidebarStore>()(
       setIsCollapsed: (collapsed) => set({ isCollapsed: collapsed }),
       isDragging: false,
       setIsDragging: (isDragging) => set({ isDragging }),
+      chatWidth: 360,
+      setChatWidth: (chatWidth) => set({ chatWidth }),
+      isMenuHidden: false,
+      setIsMenuHidden: (isMenuHidden) => set({ isMenuHidden }),
     }),
     {
       name: 'sidebar-preferences',
-      partialize: (state) => ({ width: state.width, isCollapsed: state.isCollapsed }),
+      storage: hydrationGatedStorage((): boolean => useSidebarStore.persist.hasHydrated()),
+      partialize: (state) => ({
+        width: state.width,
+        isCollapsed: state.isCollapsed,
+        chatWidth: state.chatWidth,
+        isMenuHidden: state.isMenuHidden,
+      }),
       skipHydration: true,
     },
   ),

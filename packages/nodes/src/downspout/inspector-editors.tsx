@@ -6,6 +6,7 @@ import {
   type GutterNode,
   type GutterOutlet,
   useLiveNodeOverrides,
+  usePascalI18n,
   useScene,
 } from '@pascal-app/core'
 import { SliderControl } from '@pascal-app/editor'
@@ -31,6 +32,7 @@ import { SliderControl } from '@pascal-app/editor'
  * downspout isn't linked to an outlet.
  */
 export function DownspoutPositionEditor({ node }: { node: DownspoutNode }) {
+  const i18n = usePascalI18n()
   const gutter = useScene((s) =>
     node.gutterId ? (s.nodes[node.gutterId as AnyNodeId] as GutterNode | undefined) : undefined,
   )
@@ -66,14 +68,25 @@ export function DownspoutPositionEditor({ node }: { node: DownspoutNode }) {
   const handleCommit = (offset: number) => {
     // Commit once to the store, then drop the override.
     const state = useScene.getState()
-    state.updateNode(gutterId, { outlets: withOffset(offset) })
+    const outlets = withOffset(offset).map((entry) =>
+      entry.id === node.outletId ? { ...entry, generatedBy: undefined } : entry,
+    )
+    const metadata =
+      node.metadata && typeof node.metadata === 'object' && !Array.isArray(node.metadata)
+        ? { ...node.metadata }
+        : {}
+    delete metadata.generatedBy
+    state.updateNodes([
+      { id: gutterId, data: { outlets } },
+      { id: node.id as AnyNodeId, data: { metadata: metadata as DownspoutNode['metadata'] } },
+    ])
     useLiveNodeOverrides.getState().clear(gutterId)
     state.markDirty(gutterId)
   }
 
   return (
     <SliderControl
-      label="Position"
+      label={i18n._({ id: 'node.downspout.inspectorEditors.position', message: 'Position' })}
       max={bound}
       min={-bound}
       onChange={handleChange}

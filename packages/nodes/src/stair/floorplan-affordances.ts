@@ -1,23 +1,22 @@
 import {
   type AnyNodeId,
+  createAngleAccumulator,
   type FloorplanAffordance,
   type FloorplanAffordanceSession,
+  planStairSweepEdit,
   type StairNode,
   type StairSegmentNode,
+  useLiveNodeOverrides,
   useScene,
 } from '@pascal-app/core'
+import { isAngleSnapActive } from '@pascal-app/editor'
 import { rotateAffordanceDelta } from '../shared/rotate-affordance'
 
-// Minimums + max sweep mirror the 3D handles in
-// `packages/editor/src/components/editor/stair-segment-handles.tsx` so a 2D
-// drag can't push a stair past what the 3D drag would allow.
-const MIN_SEGMENT_WIDTH = 0.4
-const MIN_SEGMENT_LENGTH = 0.4
-const MIN_CURVED_WIDTH = 0.4
-const MIN_CURVED_INNER_RADIUS_SPIRAL = 0.05
-const MIN_CURVED_INNER_RADIUS_CURVED = 0.2
-const MIN_CURVED_SWEEP = Math.PI / 12
-const MAX_CURVED_SWEEP = Math.PI * 2 - 0.05
+const MIN_SEGMENT_WIDTH = 0.001
+const MIN_SEGMENT_LENGTH = 0.001
+const MIN_CURVED_WIDTH = 0.001
+const MIN_CURVED_INNER_RADIUS_SPIRAL = 0.001
+const MIN_CURVED_INNER_RADIUS_CURVED = 0.001
 
 type SegmentWidthPayload = {
   segmentId: string
@@ -73,12 +72,14 @@ export const segmentWidthAffordance: FloorplanAffordance<StairNode> = {
         const delta = sign * (currentProj - initialProj)
         const newWidth = Math.max(MIN_SEGMENT_WIDTH, initialWidth + delta)
         lastWidth = newWidth
-        useScene.getState().updateNode(segmentNodeId, { width: newWidth })
+        useLiveNodeOverrides.getState().set(segmentNodeId, { width: newWidth })
+        useScene.getState().markDirty(segmentNodeId)
       },
       canCommit() {
         return true
       },
       commit() {
+        useLiveNodeOverrides.getState().clear(segmentNodeId)
         useScene.getState().updateNode(segmentNodeId, { width: lastWidth })
       },
     }
@@ -111,12 +112,14 @@ export const segmentLengthAffordance: FloorplanAffordance<StairNode> = {
         const delta = currentProj - initialProj
         const newLength = Math.max(MIN_SEGMENT_LENGTH, initialLength + delta)
         lastLength = newLength
-        useScene.getState().updateNode(segmentNodeId, { length: newLength })
+        useLiveNodeOverrides.getState().set(segmentNodeId, { length: newLength })
+        useScene.getState().markDirty(segmentNodeId)
       },
       canCommit() {
         return true
       },
       commit() {
+        useLiveNodeOverrides.getState().clear(segmentNodeId)
         useScene.getState().updateNode(segmentNodeId, { length: lastLength })
       },
     }
@@ -149,12 +152,14 @@ export const curvedStairWidthAffordance: FloorplanAffordance<StairNode> = {
         const currentRadial = (planPoint[0] - cx) * radialX + (planPoint[1] - cz) * radialZ
         const newWidth = Math.max(MIN_CURVED_WIDTH, initialWidth + (currentRadial - initialRadial))
         lastWidth = newWidth
-        useScene.getState().updateNode(stairId, { width: newWidth })
+        useLiveNodeOverrides.getState().set(stairId, { width: newWidth })
+        useScene.getState().markDirty(stairId)
       },
       canCommit() {
         return true
       },
       commit() {
+        useLiveNodeOverrides.getState().clear(stairId)
         useScene.getState().updateNode(stairId, { width: lastWidth })
       },
     }
@@ -200,12 +205,17 @@ export const curvedStairInnerRadiusAffordance: FloorplanAffordance<StairNode> = 
         const newWidth = initialOuterRadius - newInner
         lastInner = newInner
         lastWidth = newWidth
-        useScene.getState().updateNode(stairId, { innerRadius: newInner, width: newWidth })
+        useLiveNodeOverrides.getState().set(stairId, {
+          innerRadius: newInner,
+          width: newWidth,
+        })
+        useScene.getState().markDirty(stairId)
       },
       canCommit() {
         return true
       },
       commit() {
+        useLiveNodeOverrides.getState().clear(stairId)
         useScene.getState().updateNode(stairId, { innerRadius: lastInner, width: lastWidth })
       },
     }
@@ -233,21 +243,23 @@ export const stairRotateAffordance: FloorplanAffordance<StairNode> = {
 
     return {
       affectedIds: [stairId],
-      apply({ planPoint, modifiers }) {
+      apply({ planPoint }) {
         const delta = rotateAffordanceDelta({
           center: [cx, cz],
           initialAngle,
           planPoint,
-          free: modifiers.shiftKey,
+          free: !isAngleSnapActive(),
         })
         const newRotation = initialRotation - delta
         lastRotation = newRotation
-        useScene.getState().updateNode(stairId, { rotation: newRotation })
+        useLiveNodeOverrides.getState().set(stairId, { rotation: newRotation })
+        useScene.getState().markDirty(stairId)
       },
       canCommit() {
         return true
       },
       commit() {
+        useLiveNodeOverrides.getState().clear(stairId)
         useScene.getState().updateNode(stairId, { rotation: lastRotation })
       },
     }
@@ -269,11 +281,11 @@ export const curvedStairSweepAffordance: FloorplanAffordance<StairNode> = {
     const stairId = node.id as AnyNodeId
     const initialSweep =
       node.sweepAngle ?? (node.stairType === 'spiral' ? Math.PI * 2 : Math.PI / 2)
-    const sweepSign = Math.sign(initialSweep) || 1
     const initialRotation = node.rotation
     const cx = node.position[0]
     const cz = node.position[2]
     const initialAngle = Math.atan2(initialPlanPoint[1] - cz, initialPlanPoint[0] - cx)
+    const accumulateAngle = createAngleAccumulator(initialAngle)
     let lastSweep = initialSweep
     let lastRotation = initialRotation
 
@@ -281,29 +293,25 @@ export const curvedStairSweepAffordance: FloorplanAffordance<StairNode> = {
       affectedIds: [stairId],
       apply({ planPoint }) {
         const currentAngle = Math.atan2(planPoint[1] - cz, planPoint[0] - cx)
-        let delta = currentAngle - initialAngle
-        // Wrap to [-π, π] so a drag crossing ±π doesn't flip sign mid-gesture.
-        while (delta > Math.PI) delta -= 2 * Math.PI
-        while (delta < -Math.PI) delta += 2 * Math.PI
-
-        const sweepDelta = end === 'end' ? delta : -delta
-        const targetSweep = initialSweep + sweepDelta
-        const clampedAbs = Math.min(
-          MAX_CURVED_SWEEP,
-          Math.max(MIN_CURVED_SWEEP, Math.abs(targetSweep)),
+        const delta = accumulateAngle(currentAngle)
+        const { sweepAngle: newSweep, rotation: newRotation } = planStairSweepEdit(
+          { sweepAngle: initialSweep, rotation: initialRotation },
+          delta,
+          end,
         )
-        const newSweep = sweepSign * clampedAbs
-        const appliedDelta = newSweep - initialSweep
-        const rotationShift = end === 'end' ? -appliedDelta / 2 : appliedDelta / 2
-        const newRotation = initialRotation + rotationShift
         lastSweep = newSweep
         lastRotation = newRotation
-        useScene.getState().updateNode(stairId, { sweepAngle: newSweep, rotation: newRotation })
+        useLiveNodeOverrides.getState().set(stairId, {
+          sweepAngle: newSweep,
+          rotation: newRotation,
+        })
+        useScene.getState().markDirty(stairId)
       },
       canCommit() {
         return true
       },
       commit() {
+        useLiveNodeOverrides.getState().clear(stairId)
         useScene.getState().updateNode(stairId, { sweepAngle: lastSweep, rotation: lastRotation })
       },
     }

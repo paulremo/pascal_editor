@@ -4,9 +4,12 @@ import { resolveLevelId, type SlabNode, useLiveNodeOverrides, useScene } from '@
 import {
   boundaryReshapeScope,
   clearSlabSnapFeedback,
+  getSegmentGridStep,
   PolygonEditor,
   type PolygonEditorPlanPointSnapContext,
+  resolveSlabEdgeBandSnap,
   resolveSlabPlanPointSnap,
+  snapScalarToGrid,
   useInteractionScope,
 } from '@pascal-app/editor'
 import { useViewer } from '@pascal-app/viewer'
@@ -16,7 +19,7 @@ import { useCallback, useEffect } from 'react'
  * Phase 5 Stage D — slab boundary editor (registry-driven).
  *
  * Thin wrapper around the shared `PolygonEditor`. Activates when a
- * slab is selected in structure/select mode (not currently editing a
+ * slab is selected in select mode (not currently editing a
  * hole). The heavy lifting — vertex drag, edge slide, snap, history
  * bracketing — lives in `PolygonEditor` itself.
  *
@@ -32,7 +35,7 @@ import { useCallback, useEffect } from 'react'
  */
 export const SlabBoundaryEditor: React.FC<{ slabId: SlabNode['id'] }> = ({ slabId }) => {
   const slabNode = useScene((s) => s.nodes[slabId])
-  const updateNode = useScene((s) => s.updateNode)
+  const detachDerivedNode = useScene((s) => s.detachDerivedNode)
   const markDirty = useScene((s) => s.markDirty)
   const setSelection = useViewer((s) => s.setSelection)
 
@@ -42,10 +45,12 @@ export const SlabBoundaryEditor: React.FC<{ slabId: SlabNode['id'] }> = ({ slabI
   const handlePolygonChange = useCallback(
     (newPolygon: Array<[number, number]>) => {
       clearSlabSnapFeedback()
-      updateNode(slabId, { polygon: newPolygon })
+      // Reshaping the boundary is the sanctioned conversion of a derived floor
+      // plate into an authored slab — the reconciler stops owning it here.
+      detachDerivedNode(slabId, { polygon: newPolygon })
       setSelection({ selectedIds: [slabId] })
     },
-    [slabId, updateNode, setSelection],
+    [slabId, detachDerivedNode, setSelection],
   )
 
   const handlePolygonPreview = useCallback(
@@ -79,29 +84,73 @@ export const SlabBoundaryEditor: React.FC<{ slabId: SlabNode['id'] }> = ({ slabI
   )
 
   const resolvePolygonEditorPlanPoint = useCallback(
-    (context: PolygonEditorPlanPointSnapContext) =>
-      resolveSlabPlanPointSnap({
+    (context: PolygonEditorPlanPointSnapContext) => {
+      // Edge drags: `PolygonEditor` translates the edge by the pointer
+      // DELTA from `initialPosition` — the cursor at grab time, which sits
+      // on the edge ARROW ~0.34m outside the edge. A cursor-based wall
+      // snap here therefore commits the edge short of the wall by exactly
+      // that offset while the beacon shows a snap ON the wall. Snap the
+      // CANDIDATE EDGE onto the wall band instead (2D parity: the slab
+      // `move-edge` affordance's `snapEdge`), and hand back a point whose
+      // normal projection encodes the final travel.
+      if (context.mode === 'edge' && context.edgeIndex !== undefined) {
+        const a = context.initialPolygon[context.edgeIndex]
+        const b = context.initialPolygon[(context.edgeIndex + 1) % context.initialPolygon.length]
+        if (a && b) {
+          const dx = b[0] - a[0]
+          const dz = b[1] - a[1]
+          const length = Math.hypot(dx, dz)
+          if (length > 1e-6) {
+            // Same convention as PolygonEditor's getEdgeNormal.
+            const normalX = -dz / length
+            const normalZ = dx / length
+            const rawDelta =
+              (context.rawPoint[0] - context.initialPosition[0]) * normalX +
+              (context.rawPoint[1] - context.initialPosition[1]) * normalZ
+            const projection = snapScalarToGrid(rawDelta, getSegmentGridStep())
+            const candidate: [[number, number], [number, number]] = [
+              [a[0] + normalX * projection, a[1] + normalZ * projection],
+              [b[0] + normalX * projection, b[1] + normalZ * projection],
+            ]
+            const snap = resolveSlabEdgeBandSnap({
+              edge: candidate,
+              levelId: slabLevelId,
+              referencePoint: context.rawPoint,
+            })
+            const distance = snap
+              ? (snap.edge[0][0] - a[0]) * normalX + (snap.edge[0][1] - a[1]) * normalZ
+              : projection
+            return [
+              context.initialPosition[0] + normalX * distance,
+              context.initialPosition[1] + normalZ * distance,
+            ] as [number, number]
+          }
+        }
+      }
+      return resolveSlabPlanPointSnap({
         rawPoint: context.rawPoint,
         fallbackPoint: context.gridPoint,
         levelId: slabLevelId,
         excludeId: slabId,
-      }).point,
+      }).point
+    },
     [slabId, slabLevelId],
   )
 
   // Guarantee the override clears if the editor unmounts mid-drag
   // (selection change, mode switch) so the slab mesh doesn't get stuck
   // on a stale polygon.
-  useEffect(() => {
-    return () => {
+  useEffect(
+    () => () => {
       clearSlabSnapFeedback()
       useLiveNodeOverrides.getState().clear(slabId)
       useScene.getState().markDirty(slabId)
       useInteractionScope
         .getState()
         .endIf((s) => s.kind === 'reshaping' && s.reshape === 'boundary')
-    }
-  }, [slabId])
+    },
+    [slabId],
+  )
 
   if (!slab?.polygon || slab.polygon.length < 3) return null
 

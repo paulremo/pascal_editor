@@ -3,9 +3,12 @@
 import {
   type AnyNode,
   type AnyNodeId,
+  findLevelAncestorId,
   type GeometryContext,
   getEffectiveNode,
+  levelBaseElevationAt,
   nodeRegistry,
+  noteLevelBaseConsumer,
   type SurfaceRole,
   sceneRegistry,
   useLiveNodeOverrides,
@@ -14,11 +17,16 @@ import {
 import { useFrame } from '@react-three/fiber'
 import { useEffect, useRef } from 'react'
 import { FrontSide, type Group, type Material, type Mesh, type Object3D } from 'three'
+import { disposeObject3DResources } from '../../lib/dispose-object3d'
 import {
   type ColorPreset,
   createSurfaceRoleMaterial,
+  materialCastsShadow,
   type RenderShading,
 } from '../../lib/materials'
+import { createNodeTopSurfaceHeightSampler } from '../../lib/node-top-surface-height'
+import { timeSpan } from '../../lib/perf-tracks'
+import { createSceneSupportHeightSampler } from '../../lib/scene-support-height'
 import useViewer from '../../store/use-viewer'
 
 /**
@@ -69,6 +77,21 @@ export const GeometrySystem = () => {
   // but its geometry inputs are unchanged — e.g. an item reparenting onto a
   // shelf dirties the shelf without altering its boards.
   const builtGeometryKeyRef = useRef<Map<string, GeometryBuildCacheEntry>>(new Map())
+  const liveBuildIds = useRef<Set<AnyNodeId>>(new Set())
+
+  useEffect(() => {
+    const unsubscribe = useLiveNodeOverrides.subscribe((state, previous) => {
+      for (const id of new Set([...state.overrides.keys(), ...previous.overrides.keys()])) {
+        if (state.overrides.get(id) === previous.overrides.get(id)) continue
+        const node = useScene.getState().nodes[id as AnyNodeId]
+        if (node && nodeRegistry.get(node.type)?.geometry) liveBuildIds.current.add(id as AnyNodeId)
+      }
+    })
+    return () => {
+      unsubscribe()
+      liveBuildIds.current.clear()
+    }
+  }, [])
 
   // Re-mark every geometry-backed node dirty whenever a viewer appearance
   // value changes, so `def.geometry` builders re-run and pick up the new
@@ -107,7 +130,7 @@ export const GeometrySystem = () => {
   }, [sceneMaterials])
 
   useFrame(() => {
-    if (dirtyNodes.size === 0) return
+    if (dirtyNodes.size === 0 && liveBuildIds.current.size === 0) return
     const nodes = useScene.getState().nodes
     let rebuiltGeometry = false
 
@@ -123,18 +146,24 @@ export const GeometrySystem = () => {
       { kind: string; parentId: AnyNodeId | null; ids: AnyNodeId[] }
     >()
     const dirtyIds: AnyNodeId[] = []
-    dirtyNodes.forEach((id) => {
+    for (const id of new Set([...dirtyNodes, ...liveBuildIds.current])) {
       const node = nodes[id]
-      if (!node) return
+      if (!node) {
+        liveBuildIds.current.delete(id as AnyNodeId)
+        continue
+      }
       const def = nodeRegistry.get(node.type)
-      if (!def?.geometry) return
+      if (!def?.geometry) {
+        liveBuildIds.current.delete(id as AnyNodeId)
+        continue
+      }
       dirtyIds.push(id as AnyNodeId)
       const parentId = (node.parentId ?? null) as AnyNodeId | null
       const key: BatchKey = `${node.type}::${parentId ?? ''}`
       const existing = batches.get(key)
       if (existing) existing.ids.push(id as AnyNodeId)
       else batches.set(key, { kind: node.type, parentId, ids: [id as AnyNodeId] })
-    })
+    }
 
     // Phase 2 — for each batch whose kind declares `computeLevelData`,
     // collect every sibling in the level + run the precompute once.
@@ -159,7 +188,11 @@ export const GeometrySystem = () => {
       }
       levelDataByBatch.set(
         key,
-        (def.computeLevelData as (s: ReadonlyArray<AnyNode>) => unknown)(siblings),
+        timeSpan(
+          'geometry',
+          () => (def.computeLevelData as (s: ReadonlyArray<AnyNode>) => unknown)(siblings),
+          { name: 'geometry:levelData' },
+        ),
       )
     }
 
@@ -193,7 +226,8 @@ export const GeometrySystem = () => {
         const childLiveOverrideKey = liveChildOverrideKey(node)
         const builtKey = `${shading}|${textures}|${colorPreset}|${sceneTheme}|${def.geometryKey(effectiveNode)}|${childLiveOverrideKey}`
         if (shouldReuseGeometryBuild(builtGeometryKeyRef.current, id, group, builtKey)) {
-          clearDirty(id as AnyNodeId)
+          liveBuildIds.current.delete(id as AnyNodeId)
+          if (dirtyNodes.has(id)) clearDirty(id as AnyNodeId)
           continue
         }
       }
@@ -206,16 +240,21 @@ export const GeometrySystem = () => {
       // The builder is typed against the kind's specific node — at the
       // generic system level we lose that refinement, so the cast lands
       // here. Builders are responsible for trusting their schema.
-      const built = (
-        builder as (
-          n: AnyNode,
-          c: GeometryContext,
-          shading: RenderShading,
-          textures: boolean,
-          colorPreset: ColorPreset,
-          sceneTheme: string,
-        ) => { children: unknown[] }
-      )(effectiveNode, ctx, shading, textures, colorPreset, sceneTheme) as unknown as Group
+      const built = timeSpan(
+        'geometry',
+        () =>
+          (
+            builder as (
+              n: AnyNode,
+              c: GeometryContext,
+              shading: RenderShading,
+              textures: boolean,
+              colorPreset: ColorPreset,
+              sceneTheme: string,
+            ) => { children: unknown[] }
+          )(effectiveNode, ctx, shading, textures, colorPreset, sceneTheme) as unknown as Group,
+        { name: `geometry:${node.type}`, properties: [['node', id]] },
+      )
 
       if (!textures && def.surfaceRole) {
         applyDefaultSurfaceRole(built, def.surfaceRole, colorPreset, sceneTheme)
@@ -236,7 +275,8 @@ export const GeometrySystem = () => {
       // tick, R3F wouldn't re-apply the props, leaving the group stuck at
       // origin. Geometry builders are expected to emit local-space children.
 
-      clearDirty(id as AnyNodeId)
+      liveBuildIds.current.delete(id as AnyNodeId)
+      if (dirtyNodes.has(id)) clearDirty(id as AnyNodeId)
     }
     if (rebuiltGeometry) bumpGeometryRevision()
   }, 2)
@@ -250,7 +290,10 @@ function liveChildOverrideKey(node: AnyNode): string {
 
   const overrides = useLiveNodeOverrides.getState().overrides
   const entries: Array<[AnyNodeId, unknown]> = []
+  const childTypes = nodeRegistry.get(node.type)?.geometryChildTypes
+  const nodes = useScene.getState().nodes
   for (const childId of childIds) {
+    if (childTypes && !childTypes.includes(nodes[childId]?.type ?? '')) continue
     const override = overrides.get(childId)
     if (override) entries.push([childId, override])
   }
@@ -304,7 +347,54 @@ function buildGeometryContext(
     }
   }
 
-  return { resolve, children, siblings, parent, levelData, materials }
+  // The ground under this node, for builders that bake their own vertical
+  // origin (`ctx.levelBaseAt`). A closure rather than a scalar because the
+  // sample point is the builder's business: a fence samples its own start,
+  // and a kind that wanted to drape a span could sample along it. Resolved
+  // against the node's level ancestor, so a builder never has to know how
+  // the level graph is walked — and gets `0` when it has no level, which is
+  // the flat-ground answer those nodes already assumed.
+  //
+  // Calling it also enrolls the kind in terrain invalidation
+  // (`noteLevelBaseConsumer`) — see `terrain-support.ts` for why asking is
+  // the registration.
+  const levelId = findLevelAncestorId(node.id as AnyNodeId, nodes)
+  const levelBaseAt = (x: number, z: number) => {
+    noteLevelBaseConsumer(node.type)
+    return levelId ? levelBaseElevationAt(nodes, levelId, x, z) : 0
+  }
+
+  const surfaceSamplers = new Map<AnyNodeId, ReturnType<typeof createNodeTopSurfaceHeightSampler>>()
+  const surfaceHeightAt = (hostId: AnyNodeId, x: number, z: number) => {
+    if (!levelId) return null
+    if (!surfaceSamplers.has(hostId)) {
+      surfaceSamplers.set(hostId, createNodeTopSurfaceHeightSampler(hostId, levelId as AnyNodeId))
+    }
+    return surfaceSamplers.get(hostId)?.(x, z) ?? null
+  }
+
+  const supportSamplers = new Map<string, ReturnType<typeof createSceneSupportHeightSampler>>()
+  const supportHeightAt = (x: number, z: number, selectedHostId?: AnyNodeId) => {
+    if (!levelId) return levelBaseAt(x, z)
+    const key = selectedHostId ?? 'auto'
+    let sampler = supportSamplers.get(key)
+    if (!sampler) {
+      sampler = createSceneSupportHeightSampler(nodes, levelId as AnyNodeId, selectedHostId)
+      supportSamplers.set(key, sampler)
+    }
+    return sampler(x, z)
+  }
+  return {
+    resolve,
+    children,
+    siblings,
+    parent,
+    levelBaseAt,
+    surfaceHeightAt,
+    supportHeightAt,
+    levelData,
+    materials,
+  }
 }
 
 function disposeChildren(group: Group) {
@@ -318,22 +408,7 @@ function disposeChildren(group: Group) {
       ?.__fromGeometry
     if (!fromGeometry) continue
     group.remove(child)
-    const mesh = child as Partial<Mesh> & { geometry?: { dispose?: () => void } }
-    if (mesh.geometry?.dispose) mesh.geometry.dispose()
-    if ('material' in mesh) {
-      const m = (mesh as { material: unknown }).material
-      if (Array.isArray(m)) {
-        for (const mat of m) {
-          if (isCachedMaterial(mat)) continue
-          if (mat && typeof (mat as { dispose?: () => void }).dispose === 'function') {
-            ;(mat as { dispose: () => void }).dispose()
-          }
-        }
-      } else if (isCachedMaterial(m)) {
-      } else if (m && typeof (m as { dispose?: () => void }).dispose === 'function') {
-        ;(m as { dispose: () => void }).dispose()
-      }
-    }
+    disposeObject3DResources(child)
   }
 }
 
@@ -382,13 +457,6 @@ function getMaterialSide(material: Material | Material[]): Material['side'] {
   return source?.side ?? FrontSide
 }
 
-function isCachedMaterial(value: unknown): boolean {
-  return Boolean(
-    (value as { userData?: { __pascalCachedMaterial?: boolean } } | null)?.userData
-      ?.__pascalCachedMaterial,
-  )
-}
-
 export default GeometrySystem
 
 export type GeometryBuildCacheEntry = {
@@ -401,6 +469,8 @@ export function markGeometryBuildOutput(child: Object3D): void {
   // example a cabinet sink faucet handle), while disposal still removes only
   // top-level builder children from the registered group.
   child.traverse((object) => {
+    const mesh = object as Mesh
+    if (mesh.isMesh) mesh.castShadow = mesh.castShadow && materialCastsShadow(mesh.material)
     object.userData = {
       ...object.userData,
       __fromGeometry: true,

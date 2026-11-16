@@ -1,36 +1,59 @@
 'use client'
 
 import {
+  type AnyNode,
   type AnyNodeId,
   CabinetModuleNode,
   CabinetNode,
+  collectAlignmentAnchors,
   createSceneApi,
   emitter,
   type GridEvent,
   getFloorPlacedFootprints,
-  getWallThickness,
+  getWallLocalFaceZ,
   isCurvedWall,
+  movingAlignmentAnchors,
+  type NodeEvent,
   nodeRegistry,
+  resolveAlignment,
+  resolveSupportSlabPatch,
+  runAsSingleSceneHistoryStep,
   spatialGridManager,
+  useLocale,
   useScene,
   type WallEvent,
   type WallNode,
 } from '@pascal-app/core'
 import {
   clearPlacementSurface,
+  EDITOR_LAYER,
+  formatLinearMeasurement,
   getFloorStackPreviewPosition,
   getSideFromNormal,
+  isAlignmentGuideActive,
   isGridSnapActive,
   isMagneticSnapActive,
+  isTypingTarget,
   isValidWallSideFace,
+  LocalizedHtml,
   markToolCancelConsumed,
   movementSfxStepKey,
+  PLACEMENT_TYPING_DISTANCE_OFFSET,
   PlacementBox,
+  PlacementCoordinateInput,
+  PlacementDimensionGuides,
+  type PlacementTypingField,
+  type PlacementTypingState,
+  parseMeasurement,
+  placementTypingLengthOptions,
   publishPlacementSurface,
+  routePlacementTypingKey,
   triggerSFX,
+  useAlignmentGuides,
   useEditor,
   useFacingPose,
   usePlacementPreview,
+  usePlacementTyping,
 } from '@pascal-app/editor'
 import { useViewer } from '@pascal-app/viewer'
 import { Html } from '@react-three/drei'
@@ -38,6 +61,7 @@ import { useFrame } from '@react-three/fiber'
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { type Group, Mesh, Quaternion, Vector3 } from 'three'
 import {
+  FLOOR_PLACEMENT_ALIGNMENT_THRESHOLD_M,
   type FloorPlacementClickTriggerEvent,
   getLevelLocalSnappedPosition,
   stopPlacementCommitPropagation,
@@ -45,7 +69,8 @@ import {
   subscribeFloorPlacementDoubleClicks,
 } from '../shared/floor-placement'
 import { LevelOffsetGroup } from '../shared/level-offset-group'
-import { findClosestWallInPlan, type WallHit } from '../shared/wall-attach-target'
+import type { WallHit } from '../shared/wall-attach-target'
+import { findWallOpeningConflicts } from '../shared/wall-opening-clearance'
 import {
   type CabinetStretchPreview,
   cabinetStretchExitSide,
@@ -64,17 +89,45 @@ import {
   cabinetModuleDefinition,
   cabinetRunFootprint,
 } from './definition'
+import { parseCabinetDimensionInput } from './dimension-input'
 import { buildCabinetGeometry } from './geometry'
+import { applyCabinetModuleInsertion, cabinetModuleForRunInsertion } from './insertion'
+import { resolveCabinetNeighborPlacement } from './neighbor-placement'
+import {
+  buildCabinetPlacementSizeDimensions,
+  getCabinetPlacementCoordinates,
+  resolveCabinetPlacementDimensionPosition,
+  resolveCabinetPlacementDimensions,
+  resolveCabinetTypedPlacementPosition,
+} from './placement-dimensions'
+import {
+  resolveCabinetGridPosition,
+  resolveCabinetGridPositionInFrame,
+  resolveCabinetLevelPlanFrame,
+} from './placement-snap'
 import useCabinetPlacementStatus from './placement-status'
 import useCabinetPlacementType from './placement-type'
-import { cabinetPresetById } from './presets'
-import { runLocalToPlan } from './run-layout'
-import { addCabinetModuleSide, addCornerRun, previewCornerAdditionLayout } from './run-ops'
+import { cabinetPresetById, WALL_CABINET_ELEVATION } from './presets'
+import {
+  moduleMaxX,
+  planRunModuleInsertion,
+  planToRunLocal,
+  runLocalToPlan,
+  runWallConstraints,
+  sortRunModules,
+} from './run-layout'
+import {
+  addCabinetModuleSide,
+  addCornerRun,
+  cabinetModulesForRun,
+  cornerPinnedEndsForRun,
+  previewCornerAdditionLayout,
+  syncCornerRunsFromRunSources,
+} from './run-ops'
 import {
   type CabinetWallSnapPlacement,
-  collectCabinetWallSnapNeighbors,
-  resolveCabinetWallFaceOffset,
-  resolveCabinetWallSnapPlacement,
+  findClosestCabinetWallInPlan,
+  resolveCabinetWallSnapPlacementInScene,
 } from './wall-snap'
 
 const PREVIEW_OPACITY = 0.55
@@ -88,6 +141,7 @@ type CabinetPlacement = {
   snappedToWall: boolean
   valid: boolean
   conflictIds: string[]
+  wallId?: AnyNodeId
   wallLocalX?: number
   guide?: CabinetWallSnapPlacement['guide']
   snapReason?: CabinetWallSnapPlacement['snapReason']
@@ -96,6 +150,128 @@ type CabinetPlacement = {
   // center offsets filling the anchor→cursor span.
   stretch?: CabinetStretchPreview
   stretchAnchor?: StretchAnchor
+  insertionPreview?: CabinetInsertionPreview
+  insertionFailure?: CabinetInsertionFailure
+  neighborJoin?: { depth: number; side: 'left' | 'right'; name: string }
+}
+
+type CabinetInsertionPreview = {
+  runId: AnyNodeId
+  runPosition: [number, number, number]
+  runYaw: number
+  modules: Array<{
+    id: AnyNodeId
+    position: [number, number, number]
+    width: number
+  }>
+  inserted: {
+    position: [number, number, number]
+    width: number
+  }
+}
+
+type CabinetInsertionFailure = {
+  runId: AnyNodeId
+  reason: 'no-space'
+}
+
+function angleDelta(a: number, b: number): number {
+  return Math.atan2(Math.sin(a - b), Math.cos(a - b))
+}
+
+function resolveCabinetRunInsertion({
+  hit,
+  insertionId,
+  nodes,
+  placement,
+  parentLevelId,
+  width,
+}: {
+  hit: WallHit
+  insertionId: CabinetModuleNode['id']
+  nodes: Record<AnyNodeId, AnyNode>
+  placement: CabinetWallSnapPlacement
+  parentLevelId: AnyNodeId
+  width: number
+}):
+  | { kind: 'preview'; runId: AnyNodeId; plan: CabinetInsertionPreview }
+  | { kind: 'blocked'; runId: AnyNodeId; reason: 'no-space' }
+  | null {
+  if (isCurvedWall(hit.wall)) return null
+
+  const candidates = Object.values(nodes).filter(
+    (node): node is CabinetNode =>
+      node?.type === 'cabinet' && node.parentId === parentLevelId && node.rotation != null,
+  )
+  let best:
+    | {
+        distance: number
+        run: CabinetNode
+        modules: ReturnType<typeof cabinetModulesForRun>
+        localX: number
+      }
+    | undefined
+
+  for (const run of candidates) {
+    if (Math.abs(angleDelta(run.rotation, placement.yaw)) > 0.08) continue
+    const modules = cabinetModulesForRun(run, nodes)
+    if (modules.length < 2) continue
+    const local = planToRunLocal(run, placement.position[0], 0, placement.position[2])
+    const sorted = sortRunModules(modules)
+    const insertionIndex = sorted.findIndex((module) => moduleMaxX(module) > local[0] + 1e-4)
+    if (insertionIndex <= 0 || insertionIndex >= sorted.length) continue
+    const left = sorted[insertionIndex - 1]!
+    const right = sorted[insertionIndex]!
+    if (
+      local[0] < moduleMaxX(left) - 0.15 ||
+      local[0] > right.position[0] - right.width / 2 + 0.15
+    ) {
+      continue
+    }
+    const distance = Math.abs(local[2] - (left.position[2] + right.position[2]) / 2)
+    if (!best || distance < best.distance) best = { distance, run, modules, localX: local[0] }
+  }
+
+  if (!best) return null
+  const { run, modules, localX } = best
+  const sorted = sortRunModules(modules)
+  const insertionModule = sorted.find((module) => moduleMaxX(module) > localX + 1e-4)
+  const insertionY = insertionModule?.position[1] ?? sorted[0]!.position[1]
+  const insertionZ = insertionModule?.position[2] ?? sorted[0]!.position[2]
+  const preserveEnds = cornerPinnedEndsForRun(modules)
+  const result = planRunModuleInsertion({
+    modules,
+    insertion: {
+      id: insertionId,
+      position: [localX, insertionY, insertionZ],
+      width,
+    },
+    wallConstraints: runWallConstraints(run, modules, nodes),
+    fillerIds: new Set(
+      modules.filter((module) => module.moduleKind === 'corner-filler').map((module) => module.id),
+    ),
+    preserveEnds,
+    anchorInsertionSide: preserveEnds.right ? 'right' : 'left',
+  })
+  if (!result.ok) return { kind: 'blocked', reason: 'no-space', runId: run.id as AnyNodeId }
+  return {
+    kind: 'preview',
+    runId: run.id as AnyNodeId,
+    plan: {
+      runId: run.id as AnyNodeId,
+      runPosition: [...run.position] as [number, number, number],
+      runYaw: run.rotation,
+      modules: result.modules.map((module) => ({
+        id: module.id as AnyNodeId,
+        position: [...module.position] as [number, number, number],
+        width: module.width,
+      })),
+      inserted: {
+        position: [...result.inserted.position] as [number, number, number],
+        width: result.inserted.width,
+      },
+    },
+  }
 }
 
 type DraftSegment = {
@@ -169,11 +345,6 @@ function buildCabinetPlacementPreviewNode({
   })
 }
 
-function snap(value: number, step: number): number {
-  if (step <= 0) return value
-  return Math.round(value / step) * step
-}
-
 // Cabinet wall attachment is a placement affordance, separate from floor-grid
 // quantization. Keep the long-standing behavior in grid and magnetic modes;
 // Off remains the explicit way to place without wall attachment.
@@ -229,7 +400,7 @@ function bumpCabinetRunsNearNewRun(runId: AnyNodeId) {
 }
 
 function wallHitFromWallEvent(event: WallEvent): WallHit | null {
-  if (!event.normal || !isValidWallSideFace(event.normal) || isCurvedWall(event.node)) return null
+  if (!(event.normal && isValidWallSideFace(event.normal)) || isCurvedWall(event.node)) return null
   const wall = event.node as WallNode
   const dx = wall.end[0] - wall.start[0]
   const dy = wall.end[1] - wall.start[1]
@@ -240,7 +411,7 @@ function wallHitFromWallEvent(event: WallEvent): WallHit | null {
   return {
     wall,
     localX: event.localPosition[0],
-    perpDistance: (side === 'front' ? 1 : -1) * (getWallThickness(wall) / 2),
+    perpDistance: getWallLocalFaceZ(wall, side === 'front' ? 'a' : 'b'),
     side,
     dirX: dx / wallLength,
     dirY: dy / wallLength,
@@ -249,12 +420,20 @@ function wallHitFromWallEvent(event: WallEvent): WallHit | null {
   }
 }
 
-const CabinetTool = () => {
+const CabinetPlacementTool = () => {
   const activeLevelId = useViewer((s) => s.selection.levelId)
   const unit = useViewer((s) => s.unit)
+  const metricNotation = useViewer((s) => s.metricNotation)
+  const locale = useLocale()
+  const activeDimensionId = usePlacementPreview((s) => s.activeDimensionId)
+  const dimensionInput = usePlacementPreview((s) => s.dimensionInput)
+  const typingActive = usePlacementTyping((s) => s.isActive)
+  const typingProjectedPosition = usePlacementTyping((s) => s.projectedPosition)
   const [placement, setPlacement] = useState<CabinetPlacement | null>(null)
   const [draftSegments, setDraftSegments] = useState<DraftSegment[]>([])
   const [yaw, setYaw] = useState(0)
+  const toolDefaults = useEditor((state) => state.toolDefaults.cabinet)
+  const wallCabinet = toolDefaults?.kitchenPreset === 'wall-cabinet'
   const placementType = useCabinetPlacementType((s) => s.type)
   const islandMode = placementType === 'island'
   const yawRef = useRef(0)
@@ -269,6 +448,14 @@ const CabinetTool = () => {
   const previousWasWallSnapRef = useRef(false)
   const previousTickFrameRef = useRef(-1)
   const draftAnchorRef = useRef<DraftAnchorState | null>(null)
+  const lastRawPositionRef = useRef<[number, number, number] | null>(null)
+  const typedWallHitRef = useRef<WallHit | null>(null)
+  const typedCoordinateDefaultsRef = useRef<[number, number] | null>(null)
+  // Set while a code path intentionally ends the session *and* owns the
+  // placement afterwards (canvas-click commit, island toggle) so the
+  // restore-on-cancel logic stays out of the way.
+  const suppressTypedRestoreRef = useRef(false)
+  const lastPlacementEventRef = useRef<FloorPlacementClickTriggerEvent | null>(null)
   const activeGhostRef = useRef<Group | null>(null)
   const surfacePointRef = useRef(new Vector3())
   const surfaceNormalRef = useRef(new Vector3(0, 1, 0))
@@ -276,33 +463,87 @@ const CabinetTool = () => {
   const surfaceForwardRef = useRef(new Vector3(0, 0, 1))
   const facingPointRef = useRef(new Vector3())
 
-  const previewNode = useMemo(() => {
+  const previewNodeTemplate = useMemo(() => {
     const runDefaults = cabinetDefinition.defaults()
     return CabinetModuleNode.parse({
       ...cabinetModuleDefinition.defaults(),
       ...DEFAULT_PLACEMENT_PRESET.createPatch(),
-      showPlinth: runDefaults.showPlinth,
+      ...toolDefaults,
+      showPlinth: !wallCabinet && runDefaults.showPlinth,
       plinthHeight: runDefaults.plinthHeight,
       toeKickDepth: runDefaults.toeKickDepth,
-      withCountertop: runDefaults.withCountertop,
+      withCountertop:
+        toolDefaults?.cabinetType !== 'tall' && !wallCabinet && runDefaults.withCountertop,
       countertopThickness: runDefaults.countertopThickness,
       countertopOverhang: runDefaults.countertopOverhang,
       countertopBackOverhang: runDefaults.countertopBackOverhang,
     })
-  }, [])
+  }, [toolDefaults, wallCabinet])
+  const [previewSize, setPreviewSize] = useState(() => ({
+    depth: previewNodeTemplate.depth,
+    height: previewNodeTemplate.carcassHeight,
+    width: previewNodeTemplate.width,
+  }))
+  const previewNode = useMemo(
+    () =>
+      CabinetModuleNode.parse({
+        ...previewNodeTemplate,
+        carcassHeight: previewSize.height,
+        depth: previewSize.depth,
+        width: previewSize.width,
+      }),
+    [previewNodeTemplate, previewSize],
+  )
+  const previewNodeRef = useRef(previewNode)
+  previewNodeRef.current = previewNode
   const placementDimensions = useMemo(() => {
-    const defaults = cabinetDefinition.defaults()
     return [
       previewNode.width,
-      (defaults.showPlinth ? defaults.plinthHeight : 0) +
+      (previewNode.showPlinth ? previewNode.plinthHeight : 0) +
         previewNode.carcassHeight +
-        (defaults.withCountertop ? defaults.countertopThickness : 0),
+        (previewNode.withCountertop ? previewNode.countertopThickness : 0),
       previewNode.depth + (islandMode ? ISLAND_SEATING_OVERHANG : 0),
     ] as [number, number, number]
   }, [previewNode, islandMode])
+  const placementDimensionsRef = useRef(placementDimensions)
+  placementDimensionsRef.current = placementDimensions
+  const placementSnapFootprint = useMemo(() => {
+    const sideAndFrontOverhang = previewNode.withCountertop ? previewNode.countertopOverhang : 0
+    const backOverhang = islandMode ? ISLAND_SEATING_OVERHANG : 0
+    return {
+      dimensions: [
+        previewNode.width + sideAndFrontOverhang * 2,
+        placementDimensions[1],
+        previewNode.depth + sideAndFrontOverhang + backOverhang,
+      ] as [number, number, number],
+      offset: [0, (sideAndFrontOverhang - backOverhang) / 2] as [number, number],
+    }
+  }, [islandMode, placementDimensions, previewNode])
+  const placementSnapFootprintRef = useRef(placementSnapFootprint)
+  placementSnapFootprintRef.current = placementSnapFootprint
   const ghost = useMemo(() => {
     const group = buildCabinetGeometry(previewNode)
     group.traverse((child) => {
+      if (child instanceof Mesh) {
+        child.material = child.material.clone()
+        child.material.transparent = true
+        child.material.opacity = PREVIEW_OPACITY
+        child.raycast = () => {}
+      }
+    })
+    return group
+  }, [previewNode])
+  const insertionGhost = useMemo(() => {
+    const node = CabinetModuleNode.parse({
+      ...previewNode,
+      plinthHeight: 0,
+      showPlinth: false,
+      countertopThickness: 0,
+      withCountertop: false,
+    })
+    const group = buildCabinetGeometry(node)
+    group.traverse((child) => {
+      child.layers.set(EDITOR_LAYER)
       if (child instanceof Mesh) {
         child.material = child.material.clone()
         child.material.transparent = true
@@ -325,32 +566,125 @@ const CabinetTool = () => {
     },
     [ghost],
   )
+  const insertionGhostPoolRef = useRef<Group[]>([])
+  const insertionGhostForIndex = useCallback(
+    (index: number): Group => {
+      if (index === 0) return insertionGhost
+      const pool = insertionGhostPoolRef.current
+      while (pool.length < index) pool.push(insertionGhost.clone())
+      return pool[index - 1] as Group
+    },
+    [insertionGhost],
+  )
 
   const publishFloorplanPreview = useCallback(
     (next: CabinetPlacement, island = islandModeRef.current) => {
       const stretch = next.stretch
+      const previewPosition = stretch
+        ? runLocalToPlan({ position: next.position, rotation: next.yaw }, [
+            stretch.centerLocalX,
+            0,
+            0,
+          ])
+        : next.position
+      const livePreviewNode = next.neighborJoin
+        ? { ...previewNodeRef.current, depth: next.neighborJoin.depth }
+        : previewNodeRef.current
       const node = buildCabinetPlacementPreviewNode({
         island,
-        position: stretch
-          ? runLocalToPlan({ position: next.position, rotation: next.yaw }, [
-              stretch.centerLocalX,
-              0,
-              0,
-            ])
-          : next.position,
-        previewModule: previewNode,
+        position: previewPosition,
+        previewModule: livePreviewNode,
         yaw: next.yaw,
       })
+      const previewModules = (stretch?.modules ?? [{ x: 0, width: livePreviewNode.width }]).map(
+        (module) =>
+          CabinetModuleNode.parse({
+            ...livePreviewNode,
+            id: undefined,
+            parentId: node.id,
+            position: [module.x - (stretch?.centerLocalX ?? 0), 0, 0],
+            width: module.width,
+          }),
+      )
+      let floorplanNode: AnyNode = {
+        ...node,
+        parentId: activeLevelId,
+        children: previewModules.map((module) => module.id),
+        ...(stretch ? { width: stretch.length } : {}),
+      }
+      let floorplanContextNodes: AnyNode[] = previewModules
+      if (next.insertionPreview) {
+        const liveRun = useScene.getState().nodes[next.insertionPreview.runId]
+        if (liveRun?.type === 'cabinet') {
+          const insertedId = livePreviewNode.id as AnyNodeId
+          const previewModules = [
+            ...next.insertionPreview.modules.map((planned) => {
+              const liveModule = useScene.getState().nodes[planned.id]
+              return liveModule?.type === 'cabinet-module'
+                ? ({
+                    ...liveModule,
+                    position: planned.position,
+                    width: planned.width,
+                  } as CabinetModuleNode)
+                : null
+            }),
+            CabinetModuleNode.parse({
+              ...cabinetModuleForRunInsertion(livePreviewNode, liveRun),
+              id: insertedId,
+              position: next.insertionPreview.inserted.position,
+              width: next.insertionPreview.inserted.width,
+            }),
+          ].filter((previewModule): previewModule is CabinetModuleNode => previewModule != null)
+          floorplanNode = CabinetNode.parse({
+            ...liveRun,
+            children: previewModules.map((previewModule) => previewModule.id as AnyNodeId),
+          })
+          floorplanContextNodes = previewModules as AnyNode[]
+        }
+      }
+      const placementDimensions =
+        activeLevelId && !island
+          ? resolveCabinetPlacementDimensions({
+              depth: livePreviewNode.depth,
+              levelId: activeLevelId,
+              nodes: useScene.getState().nodes,
+              position: previewPosition,
+              providedWallHit:
+                typedWallHitRef.current && next.wallLocalX != null
+                  ? { ...typedWallHitRef.current, localX: next.wallLocalX }
+                  : undefined,
+              rotation: next.yaw,
+              wallId: next.wallId,
+              width: stretch?.length ?? livePreviewNode.width,
+            })
+          : []
+      const sizeDimensions =
+        stretch || island
+          ? []
+          : buildCabinetPlacementSizeDimensions({
+              depth: livePreviewNode.depth,
+              height: livePreviewNode.carcassHeight,
+              position: previewPosition,
+              rotation: next.yaw,
+              width: livePreviewNode.width,
+            })
       // A stretched span can exceed the schema's width cap — override post-parse.
-      usePlacementPreview.getState().set(stretch ? { ...node, width: stretch.length } : node)
+      usePlacementPreview
+        .getState()
+        .set(
+          floorplanNode,
+          null,
+          [...placementDimensions, ...sizeDimensions],
+          floorplanContextNodes,
+        )
     },
-    [previewNode],
+    [activeLevelId],
   )
 
   useFrame(() => {
     const ghostGroup = activeGhostRef.current
     const current = placementRef.current
-    if (!ghostGroup || !current) {
+    if (!(ghostGroup && current)) {
       clearPlacementSurface()
       useFacingPose.getState().clear()
       return
@@ -376,7 +710,10 @@ const CabinetTool = () => {
     publishPlacementSurface(surfacePointRef.current, surfaceNormalRef.current)
     useFacingPose.getState().set({
       position: [facingPoint.x, facingPoint.y, facingPoint.z],
-      rotationY: current.snappedToWall || current.stretch ? current.yaw : yawRef.current,
+      rotationY:
+        current.snappedToWall || current.stretch || current.neighborJoin
+          ? current.yaw
+          : yawRef.current,
       depth: current.stretch ? placementDimensions[2] : previewNode.depth,
     })
   })
@@ -394,6 +731,15 @@ const CabinetTool = () => {
     previousWasWallSnapRef.current = false
     previousTickFrameRef.current = -1
     draftAnchorRef.current = null
+    typedWallHitRef.current = null
+    typedCoordinateDefaultsRef.current = null
+    lastPlacementEventRef.current = null
+    usePlacementTyping.getState().clear()
+    let alignmentCandidates = collectAlignmentAnchors(
+      useScene.getState().nodes,
+      previewNodeRef.current.id,
+      activeLevelId,
+    )
     let lastWallEventTime = -1
     let wallOwnedPointerAt = Number.NEGATIVE_INFINITY
     const WALL_OWNS_POINTER_MS = 64
@@ -417,6 +763,7 @@ const CabinetTool = () => {
       previousTickFrameRef.current = -1
       clearPlacementSurface()
       useFacingPose.getState().clear()
+      useAlignmentGuides.getState().clear()
       useCabinetPlacementStatus.getState().setBlocked(false)
     }
 
@@ -428,6 +775,15 @@ const CabinetTool = () => {
         draftAnchorRef.current !== null || draftSegmentsRef.current.length > 0
       if (hasContinuousDraft) clearDraft()
       islandModeRef.current = nextIslandMode
+      // Island mode has no wall snapping, so a live typed session would be
+      // orphaned (frozen pointer + vanished HUD). End it — the toggle owns
+      // the placement afterwards, so suppress the pose restore.
+      if (nextIslandMode && usePlacementTyping.getState().isActive) {
+        suppressTypedRestoreRef.current = true
+        usePlacementTyping.getState().clear()
+        typedWallHitRef.current = null
+        typedCoordinateDefaultsRef.current = null
+      }
       if (hasContinuousDraft) return
       // Drop a stale wall-snapped preview so the next move re-resolves free.
       if (nextIslandMode && currentPlacement?.snappedToWall) {
@@ -450,31 +806,102 @@ const CabinetTool = () => {
       return anchor
     }
 
-    const resolveRawPosition = (
-      event: FloorPlacementClickTriggerEvent,
-    ): [number, number, number] => {
-      return getLevelLocalSnappedPosition(activeLevelId, event, 0, true)
-    }
+    const resolveRawPosition = (event: FloorPlacementClickTriggerEvent): [number, number, number] =>
+      getLevelLocalSnappedPosition(activeLevelId, event, 0, true)
 
     const resolveGridPosition = (
       raw: [number, number, number],
       bypassGrid = false,
     ): [number, number, number] => {
       const step = !bypassGrid && isGridSnapActive() ? useEditor.getState().gridSnapStep : 0
-      return [snap(raw[0], step), 0, snap(raw[2], step)]
+      if (step > 0) {
+        const frame = resolveCabinetLevelPlanFrame(activeLevelId, useScene.getState().nodes)
+        return resolveCabinetGridPositionInFrame({
+          raw,
+          dimensions: placementSnapFootprintRef.current.dimensions,
+          footprintOffset: placementSnapFootprintRef.current.offset,
+          yaw: yawRef.current,
+          step,
+          frame,
+        })
+      }
+      return resolveCabinetGridPosition({
+        raw,
+        dimensions: placementSnapFootprintRef.current.dimensions,
+        footprintOffset: placementSnapFootprintRef.current.offset,
+        yaw: yawRef.current,
+        step,
+      })
+    }
+
+    const resolveAlignedCabinetPosition = ({
+      applyAlignmentSnap,
+      position,
+      width,
+      yaw,
+    }: {
+      applyAlignmentSnap: boolean
+      position: [number, number, number]
+      width?: number
+      yaw: number
+    }): [number, number, number] => {
+      if (!isAlignmentGuideActive()) {
+        useAlignmentGuides.getState().clear()
+        return position
+      }
+
+      const alignmentNode = buildCabinetPlacementPreviewNode({
+        island: islandModeRef.current,
+        position,
+        previewModule: previewNodeRef.current,
+        yaw,
+      })
+      const moving = movingAlignmentAnchors(
+        {
+          ...alignmentNode,
+          ...(width == null ? null : { width }),
+        } as AnyNode,
+        useScene.getState().nodes,
+        position[0],
+        position[2],
+        yaw,
+      )
+      if (moving.length === 0 || alignmentCandidates.length === 0) {
+        useAlignmentGuides.getState().clear()
+        return position
+      }
+
+      const result = resolveAlignment({
+        moving,
+        candidates: alignmentCandidates,
+        threshold: FLOOR_PLACEMENT_ALIGNMENT_THRESHOLD_M,
+      })
+      useAlignmentGuides.getState().set(result.guides)
+
+      if (!(applyAlignmentSnap && result.snap)) return position
+      return [position[0] + result.snap.dx, position[1], position[2] + result.snap.dz]
     }
 
     const withPlacementValidity = (
       next: Omit<CabinetPlacement, 'conflictIds' | 'valid'>,
       bypassCollision: boolean,
     ): CabinetPlacement => {
-      if (bypassCollision) return { ...next, conflictIds: [], valid: true }
-      const floorPlaced = nodeRegistry.get(previewNode.type)?.capabilities?.floorPlaced
+      if (wallCabinet && !next.insertionPreview)
+        next = { ...next, position: [next.position[0], WALL_CABINET_ELEVATION, next.position[2]] }
+      if (bypassCollision) {
+        return { ...next, conflictIds: [], valid: !next.insertionFailure }
+      }
+      const livePreviewNode = next.neighborJoin
+        ? { ...previewNodeRef.current, depth: next.neighborJoin.depth }
+        : previewNodeRef.current
+      const livePlacementDimensions = placementDimensionsRef.current
+      const floorPlaced = nodeRegistry.get(livePreviewNode.type)?.capabilities?.floorPlaced
       const effectiveNode = {
-        ...previewNode,
+        ...livePreviewNode,
         position: next.position,
         rotation: next.yaw,
       }
+      const ignoreIds = next.insertionPreview ? [next.insertionPreview.runId] : undefined
       const footprints = floorPlaced
         ? getFloorPlacedFootprints(floorPlaced, effectiveNode, {
             nodes: useScene.getState().nodes,
@@ -490,37 +917,44 @@ const CabinetTool = () => {
         : []
       const result =
         footprints.length > 0
-          ? spatialGridManager.canPlaceOnFloorFootprints(activeLevelId, footprints)
-          : spatialGridManager.canPlaceOnFloor(activeLevelId, next.position, placementDimensions, [
-              0,
-              next.yaw,
-              0,
-            ])
-      return { ...next, conflictIds: result.conflictIds, valid: result.valid }
+          ? spatialGridManager.canPlaceOnFloorFootprints(activeLevelId, footprints, ignoreIds)
+          : spatialGridManager.canPlaceOnFloor(
+              activeLevelId,
+              next.position,
+              livePlacementDimensions,
+              [0, next.yaw, 0],
+              ignoreIds,
+            )
+      const wall = next.wallId ? useScene.getState().nodes[next.wallId] : undefined
+      const openingConflictIds =
+        wall?.type === 'wall' && next.wallLocalX != null
+          ? findWallOpeningConflicts({
+              bottom: next.position[1],
+              height: livePlacementDimensions[1],
+              localX: next.wallLocalX,
+              nodes: useScene.getState().nodes,
+              wall,
+              width: livePreviewNode.width,
+            })
+          : []
+      const conflictIds = [...new Set([...result.conflictIds, ...openingConflictIds])]
+      return {
+        ...next,
+        conflictIds,
+        valid: !next.insertionFailure && result.valid && openingConflictIds.length === 0,
+      }
     }
 
     const resolveWallHitPlacement = (hit: WallHit): CabinetPlacement | null => {
       if (!isWallSnapEligible()) return null
       const nodes = useScene.getState().nodes
-      const neighbors = collectCabinetWallSnapNeighbors({
-        hit,
-        nodes,
-        parentLevelId: activeLevelId as AnyNodeId,
-        width: previewNode.width,
-      })
-      const faceOffset = resolveCabinetWallFaceOffset({
-        hit,
-        nodes,
-        parentLevelId: activeLevelId as AnyNodeId,
-      })
-
-      const wallPlacement = resolveCabinetWallSnapPlacement({
-        depth: previewNode.depth,
-        faceOffset,
+      const wallPlacement = resolveCabinetWallSnapPlacementInScene({
+        depth: previewNodeRef.current.depth,
         gridStep: isGridSnapActive() ? useEditor.getState().gridSnapStep : 0,
         hit,
-        neighbors,
-        width: previewNode.width,
+        nodes,
+        parentLevelId: activeLevelId as AnyNodeId,
+        width: previewNodeRef.current.width,
       })
       if (!wallPlacement) return null
       const wallSurfaceNormal = [Math.sin(wallPlacement.yaw), 0, Math.cos(wallPlacement.yaw)] as [
@@ -529,12 +963,37 @@ const CabinetTool = () => {
         number,
       ]
 
+      const insertion = wallCabinet
+        ? null
+        : resolveCabinetRunInsertion({
+            hit,
+            insertionId: previewNodeRef.current.id,
+            nodes,
+            placement: wallPlacement,
+            parentLevelId: activeLevelId as AnyNodeId,
+            width: previewNodeRef.current.width,
+          })
+      const insertionPreview = insertion?.kind === 'preview' ? insertion.plan : undefined
+      const insertionFailure =
+        insertion?.kind === 'blocked'
+          ? { runId: insertion.runId, reason: insertion.reason }
+          : undefined
+      const insertionPosition = insertionPreview
+        ? runLocalToPlan(
+            { position: insertionPreview.runPosition, rotation: insertionPreview.runYaw },
+            insertionPreview.inserted.position,
+          )
+        : wallPlacement.position
+
       return {
         conflictIds: [],
         guide: wallPlacement.guide,
-        position: wallPlacement.position,
+        ...(insertionFailure ? { insertionFailure } : {}),
+        ...(insertionPreview ? { insertionPreview } : {}),
+        position: insertionPosition,
         snapReason: wallPlacement.snapReason,
         valid: true,
+        wallId: hit.wall.id as AnyNodeId,
         wallLocalX: wallPlacement.localX,
         wallSurfaceNormal,
         yaw: wallPlacement.yaw,
@@ -545,23 +1004,149 @@ const CabinetTool = () => {
     const resolveWallPlacement = (raw: [number, number, number]): CabinetPlacement | null => {
       if (!isWallSnapEligible()) return null
       const nodes = useScene.getState().nodes
-      const hit = findClosestWallInPlan([raw[0], raw[2]], nodes, activeLevelId as AnyNodeId)
+      const hit = findClosestCabinetWallInPlan({
+        excludeIds: [],
+        nodes,
+        parentLevelId: activeLevelId as AnyNodeId,
+        planPoint: [raw[0], raw[2]],
+      })
       if (!hit) return null
       return resolveWallHitPlacement(hit)
     }
 
     const resolvePlacement = (event: FloorPlacementClickTriggerEvent): CabinetPlacement => {
       const raw = resolveRawPosition(event)
+      lastRawPositionRef.current = raw
       const forcePlacement = isForcePlacementEvent(event)
+      // Alt forces past every snap, a run's magnetic join included (E-004).
+      const neighbor =
+        !forcePlacement &&
+        !islandModeRef.current &&
+        isMagneticSnapActive() &&
+        useEditor.getState().getContinuation('cabinet') === 'single'
+          ? resolveCabinetNeighborPlacement({
+              nodes: useScene.getState().nodes,
+              levelId: activeLevelId,
+              position: raw,
+              module: previewNodeRef.current,
+              wallTier: wallCabinet,
+            })
+          : null
+      if (neighbor) {
+        const { run, result, depth, side } = neighbor
+        if (result.ok) {
+          useAlignmentGuides.getState().clear()
+          const position = runLocalToPlan(run, result.inserted.position)
+          const wallPose = resolveWallPlacement(position)
+          return withPlacementValidity(
+            {
+              position,
+              ...(wallPose && Math.abs(angleDelta(wallPose.yaw, run.rotation)) < 0.08
+                ? { wallId: wallPose.wallId, wallLocalX: wallPose.wallLocalX }
+                : {}),
+              yaw: run.rotation,
+              snappedToWall: false,
+              neighborJoin: { depth, side, name: run.name || 'Kitchen run' },
+              insertionPreview: {
+                runId: run.id,
+                runPosition: run.position,
+                runYaw: run.rotation,
+                modules: result.modules,
+                inserted: result.inserted,
+              },
+            },
+            forcePlacement,
+          )
+        }
+        return {
+          position: raw,
+          yaw: run.rotation,
+          snappedToWall: false,
+          valid: false,
+          conflictIds: [],
+          insertionFailure: { runId: run.id, reason: 'no-space' },
+        }
+      }
       const wallPlacement = islandModeRef.current ? null : resolveWallPlacement(raw)
-      if (wallPlacement) return withPlacementValidity(wallPlacement, forcePlacement)
+      if (wallPlacement) {
+        return withPlacementValidity(
+          {
+            ...wallPlacement,
+            position: resolveAlignedCabinetPosition({
+              applyAlignmentSnap: false,
+              position: wallPlacement.position,
+              yaw: wallPlacement.yaw,
+            }),
+          },
+          forcePlacement,
+        )
+      }
+      const position = resolveAlignedCabinetPosition({
+        applyAlignmentSnap: isMagneticSnapActive(),
+        position: resolveGridPosition(raw),
+        yaw: yawRef.current,
+      })
       return withPlacementValidity(
         {
-          position: resolveGridPosition(raw),
+          position,
           yaw: yawRef.current,
           snappedToWall: false,
         },
         forcePlacement,
+      )
+    }
+
+    const resolveStretchedValidity = (
+      anchor: StretchAnchor,
+      stretch: CabinetStretchPreview,
+      forcePlace: boolean,
+    ) => {
+      const spanCenter = runLocalToPlan({ position: anchor.position, rotation: anchor.yaw }, [
+        stretch.centerLocalX,
+        0,
+        0,
+      ])
+      const ignoreIds = chainRootRunRef.current
+        ? [chainRootRunRef.current.id as AnyNodeId]
+        : undefined
+      return resolveCabinetContinuousValidity(
+        (() => {
+          const floorResult = spatialGridManager.canPlaceOnFloor(
+            activeLevelId,
+            spanCenter,
+            [stretch.length, placementDimensionsRef.current[1], placementDimensionsRef.current[2]],
+            [0, anchor.yaw, 0],
+            ignoreIds,
+          )
+          const nodes = useScene.getState().nodes
+          const wall = anchor.wallId ? nodes[anchor.wallId] : undefined
+          const wallHit =
+            wall?.type === 'wall' && anchor.wallLocalX != null
+              ? { wall, localX: anchor.wallLocalX + stretch.centerLocalX }
+              : findClosestCabinetWallInPlan({
+                  excludeIds: [],
+                  nodes,
+                  parentLevelId: activeLevelId as AnyNodeId,
+                  planPoint: [spanCenter[0], spanCenter[2]],
+                  yaw: anchor.yaw,
+                })
+          const openingConflictIds =
+            wallHit && (wallHit.localX ?? null) != null
+              ? findWallOpeningConflicts({
+                  bottom: 0,
+                  height: placementDimensionsRef.current[1],
+                  localX: wallHit.localX!,
+                  nodes,
+                  wall: wallHit.wall,
+                  width: stretch.length,
+                })
+              : []
+          return {
+            conflictIds: [...new Set([...floorResult.conflictIds, ...openingConflictIds])],
+            valid: floorResult.valid && openingConflictIds.length === 0,
+          }
+        })(),
+        forcePlace,
       )
     }
 
@@ -570,11 +1155,16 @@ const CabinetTool = () => {
     const resolveStretchedPlacement = (
       anchor: StretchAnchor,
       event: FloorPlacementClickTriggerEvent,
+      rawOverride?: [number, number, number],
     ): CabinetPlacement => {
-      const raw = resolveRawPosition(event)
+      useAlignmentGuides.getState().clear()
+      // `rawOverride` lets callers seed the stretch geometry directly (typed
+      // entry commits at the typed pose — the reused pointer event's cursor
+      // position is stale and must not grow the run).
+      const raw = rawOverride ?? resolveRawPosition(event)
       let stretch = planCabinetContinuousStretch({
         anchor,
-        previewWidth: previewNode.width,
+        previewWidth: previewNodeRef.current.width,
         rawPlanPosition: raw,
       })
       if (
@@ -594,6 +1184,8 @@ const CabinetTool = () => {
             position: anchor.position,
             yaw: anchor.yaw,
             snappedToWall: anchor.snappedToWall,
+            wallId: anchor.wallId,
+            wallLocalX: anchor.wallLocalX,
             wallSurfaceNormal: anchor.wallSurfaceNormal,
             valid: false,
             conflictIds: [],
@@ -603,28 +1195,13 @@ const CabinetTool = () => {
         }
         stretch = stretchWithAdjustedConnectedWidth(stretch, preview.connectedWidth)
       }
-      const spanCenter = runLocalToPlan({ position: anchor.position, rotation: anchor.yaw }, [
-        stretch.centerLocalX,
-        0,
-        0,
-      ])
-      const ignoreIds = chainRootRunRef.current
-        ? [chainRootRunRef.current.id as AnyNodeId]
-        : undefined
-      const result = resolveCabinetContinuousValidity(
-        spatialGridManager.canPlaceOnFloor(
-          activeLevelId,
-          spanCenter,
-          [stretch.length, placementDimensions[1], placementDimensions[2]],
-          [0, anchor.yaw, 0],
-          ignoreIds,
-        ),
-        isForcePlacementEvent(event),
-      )
+      const result = resolveStretchedValidity(anchor, stretch, isForcePlacementEvent(event))
       return {
         position: anchor.position,
         yaw: anchor.yaw,
         snappedToWall: anchor.snappedToWall,
+        wallId: anchor.wallId,
+        wallLocalX: anchor.wallLocalX,
         wallSurfaceNormal: anchor.wallSurfaceNormal,
         valid: result.valid,
         conflictIds: result.conflictIds,
@@ -650,6 +1227,19 @@ const CabinetTool = () => {
       placementRef.current = next
       setPlacement(next)
       useCabinetPlacementStatus.getState().setBlocked(!next.valid)
+      useCabinetPlacementStatus
+        .getState()
+        .setTarget(
+          !next.valid
+            ? next.insertionFailure
+              ? 'No space in this kitchen run'
+              : 'Placement blocked: overlaps an item or wall opening'
+            : next.neighborJoin
+              ? `${next.valid ? 'Join' : 'Blocked beside'} ${next.neighborJoin.name} · ${next.neighborJoin.side} side · Depth matched`
+              : next.insertionFailure
+                ? 'No space in this kitchen run'
+                : null,
+        )
       publishFloorplanPreview(next)
       const nextSnapKey = movementSfxStepKey({
         coords:
@@ -676,6 +1266,8 @@ const CabinetTool = () => {
     const onGridMove = (event: GridEvent) => {
       const ts = event.nativeEvent?.timeStamp ?? -1
       if (ts === lastWallEventTime || wallOwnsPointer()) return
+      if (usePlacementTyping.getState().isActive) return
+      lastPlacementEventRef.current = event
       const anchor = resolveDraftAnchor()
       if (anchor) {
         publishPlacement(resolveActiveStretchPlacement(anchor, event), ts)
@@ -687,12 +1279,26 @@ const CabinetTool = () => {
     const onWallMove = (event: WallEvent) => {
       lastWallEventTime = event.nativeEvent?.timeStamp ?? -1
       if (event.node.parentId !== activeLevelId) return
+      if (usePlacementTyping.getState().isActive) {
+        event.stopPropagation()
+        return
+      }
+      lastPlacementEventRef.current = event
       const anchor = resolveDraftAnchor()
       if (anchor) {
         markWallOwnedPointer()
         publishPlacement(resolveActiveStretchPlacement(anchor, event), lastWallEventTime)
         event.stopPropagation()
         return
+      }
+      if (useEditor.getState().getContinuation('cabinet') === 'single') {
+        const adjacent = resolvePlacement(event)
+        if (adjacent.neighborJoin || adjacent.insertionFailure) {
+          markWallOwnedPointer()
+          publishPlacement(adjacent, lastWallEventTime)
+          event.stopPropagation()
+          return
+        }
       }
       const hit = islandModeRef.current ? null : wallHitFromWallEvent(event)
       const next = hit ? resolveWallHitPlacement(hit) : null
@@ -709,15 +1315,24 @@ const CabinetTool = () => {
     }
 
     const buildRunNodes = (position: [number, number, number], yaw: number) => {
-      const patch = DEFAULT_PLACEMENT_PRESET.createPatch()
+      const patch = { ...DEFAULT_PLACEMENT_PRESET.createPatch(), ...toolDefaults }
       const island = islandModeRef.current
       const cabinet = CabinetNode.parse({
         ...cabinetDefinition.defaults(),
-        name: island ? 'Kitchen Island' : 'Modular Cabinet',
+        ...(toolDefaults?.kitchenPreset ? {} : toolDefaults),
+        name: island ? 'Kitchen Island' : wallCabinet ? 'Wall cabinets' : 'Kitchen run',
+        runTier: wallCabinet ? 'wall' : 'base',
+        showPlinth: previewNode.showPlinth,
+        withCountertop: !wallCabinet,
         position,
         rotation: yaw,
-        depth: patch.depth ?? cabinetDefinition.defaults().depth,
-        carcassHeight: patch.carcassHeight ?? cabinetDefinition.defaults().carcassHeight,
+        parentId: activeLevelId,
+        width: previewNode.width,
+        depth: previewNode.depth,
+        carcassHeight:
+          previewNode.cabinetType === 'tall'
+            ? cabinetDefinition.defaults().carcassHeight
+            : previewNode.carcassHeight,
         ...(island && {
           countertopBackOverhang: ISLAND_SEATING_OVERHANG,
           withFinishedBack: true,
@@ -727,12 +1342,16 @@ const CabinetTool = () => {
         CabinetModuleNode.parse({
           ...cabinetModuleDefinition.defaults(),
           ...patch,
-          name: index === 0 ? (patch.name ?? 'Base Cabinet') : `Base Cabinet ${index + 1}`,
+          ...toolDefaults,
+          name:
+            index === 0
+              ? (patch.name ?? 'Base Cabinet')
+              : `${patch.name ?? 'Base Cabinet'} ${index + 1}`,
           parentId: cabinet.id,
           position: [localX, runModuleBaseY(cabinet.plinthHeight, cabinet.showPlinth), 0],
           width,
           depth: cabinet.depth,
-          carcassHeight: cabinet.carcassHeight,
+          carcassHeight: previewNode.carcassHeight,
           plinthHeight: cabinet.plinthHeight,
           toeKickDepth: cabinet.toeKickDepth,
           countertopThickness: cabinet.countertopThickness,
@@ -750,7 +1369,7 @@ const CabinetTool = () => {
       const sceneApi = createSceneApi(useScene)
       sceneApi.pauseHistory()
       try {
-        if (!chainRunRef.current || !chainEndModuleRef.current || !chainCornerSideRef.current) {
+        if (!(chainRunRef.current && chainEndModuleRef.current && chainCornerSideRef.current)) {
           const { cabinet, buildModule } = buildRunNodes(
             segment.anchor.position,
             segment.anchor.yaw,
@@ -760,11 +1379,16 @@ const CabinetTool = () => {
             buildModule(m.x, m.width, index),
           )
           for (const module of modules) sceneApi.upsert(module, cabinet.id as AnyNodeId)
+          const liveRun = sceneApi.get<CabinetNode>(cabinet.id as AnyNodeId) ?? cabinet
+          sceneApi.update(
+            liveRun.id as AnyNodeId,
+            resolveSupportSlabPatch(liveRun, sceneApi.nodes()),
+          )
           bumpCabinetRunsNearNewRun(cabinet.id as AnyNodeId)
           sceneApi.resumeHistory()
           return {
             endModule: modules[modules.length - 1]!,
-            run: sceneApi.get<CabinetNode>(cabinet.id as AnyNodeId) ?? cabinet,
+            run: sceneApi.get<CabinetNode>(cabinet.id as AnyNodeId) ?? liveRun,
           }
         }
 
@@ -780,7 +1404,7 @@ const CabinetTool = () => {
         const nextRun = connectedModule?.parentId
           ? sceneApi.get<CabinetNode>(connectedModule.parentId as AnyNodeId)
           : null
-        if (!connectedModule || !nextRun) throw new Error('Unable to resolve connected corner run')
+        if (!(connectedModule && nextRun)) throw new Error('Unable to resolve connected corner run')
 
         const plannedConnectedWidths = segment.stretch.modules
           .slice(1)
@@ -808,6 +1432,19 @@ const CabinetTool = () => {
         }
 
         bumpCabinetRunsNearNewRun(nextRun.id as AnyNodeId)
+        const liveNextRun = sceneApi.get<CabinetNode>(nextRun.id as AnyNodeId) ?? nextRun
+        sceneApi.update(
+          liveNextRun.id as AnyNodeId,
+          resolveSupportSlabPatch(liveNextRun, sceneApi.nodes()),
+        )
+        const rootRun = chainRootRunRef.current
+        if (rootRun) {
+          const liveRoot = sceneApi.get<CabinetNode>(rootRun.id as AnyNodeId) ?? rootRun
+          sceneApi.update(
+            liveRoot.id as AnyNodeId,
+            resolveSupportSlabPatch(liveRoot, sceneApi.nodes()),
+          )
+        }
         sceneApi.resumeHistory()
         return {
           endModule: anchorModule,
@@ -828,10 +1465,107 @@ const CabinetTool = () => {
         placementRef.current?.stretch && placementRef.current.stretchAnchor
           ? placementRef.current
           : resolveActiveStretchPlacement(anchor, event)
-      if (!currentPlacement.valid || !currentPlacement.stretch || !currentPlacement.stretchAnchor) {
+      if (!(currentPlacement.valid && currentPlacement.stretch && currentPlacement.stretchAnchor)) {
         return null
       }
       return { anchor: currentPlacement.stretchAnchor, stretch: currentPlacement.stretch }
+    }
+
+    const commitInsertion = (next: CabinetPlacement): AnyNodeId | null => {
+      const insertionPreview = next.insertionPreview
+      if (!insertionPreview) return null
+      const sceneApi = createSceneApi(useScene)
+      const run = sceneApi.get<CabinetNode>(insertionPreview.runId)
+      if (!run) return null
+      const module = cabinetModuleForRunInsertion(
+        CabinetModuleNode.parse({
+          ...previewNodeRef.current,
+          ...(next.neighborJoin ? { depth: next.neighborJoin.depth } : {}),
+          position: insertionPreview.inserted.position,
+          width: insertionPreview.inserted.width,
+        }),
+        run,
+      )
+
+      const history = useScene.temporal.getState()
+      const recorded = new Set(history.pastStates)
+      try {
+        return runAsSingleSceneHistoryStep(useScene, () => {
+          const id = applyCabinetModuleInsertion({
+            module,
+            plan: insertionPreview,
+            run,
+            sceneApi,
+          })
+          if (!id) throw new Error('Unable to apply cabinet insertion')
+          const liveRun = sceneApi.get<CabinetNode>(run.id as AnyNodeId)
+          if (!liveRun) throw new Error('Unable to resolve inserted cabinet run')
+          sceneApi.update(
+            liveRun.id as AnyNodeId,
+            resolveSupportSlabPatch(liveRun, sceneApi.nodes()),
+          )
+          syncCornerRunsFromRunSources({
+            run: sceneApi.get<CabinetNode>(liveRun.id as AnyNodeId) ?? liveRun,
+            sceneApi,
+          })
+          const updatedRun = sceneApi.get<CabinetNode>(liveRun.id as AnyNodeId) ?? liveRun
+          bumpCabinetRunsNear(
+            sceneApi,
+            [cabinetRunFootprint(updatedRun, sceneApi.nodes())],
+            new Set([updatedRun.id as AnyNodeId]),
+          )
+          return id
+        })
+      } catch {
+        // A failure part-way leaves nothing behind: undo the writes it recorded, then forget them.
+        const added = useScene.temporal
+          .getState()
+          .pastStates.filter((state) => !recorded.has(state)).length
+        if (added > 0) {
+          useScene.temporal.getState().undo(added)
+          useScene.temporal.setState({ futureStates: history.futureStates })
+        }
+        return null
+      }
+    }
+
+    const updatePreviewSize = (field: 'width' | 'depth' | 'height', value: number) => {
+      const nextPreviewNode = CabinetModuleNode.parse({
+        ...previewNodeRef.current,
+        carcassHeight: field === 'height' ? value : previewNodeRef.current.carcassHeight,
+        depth: field === 'depth' ? value : previewNodeRef.current.depth,
+        width: field === 'width' ? value : previewNodeRef.current.width,
+      })
+      previewNodeRef.current = nextPreviewNode
+      setPreviewSize({
+        depth: nextPreviewNode.depth,
+        height: nextPreviewNode.carcassHeight,
+        width: nextPreviewNode.width,
+      })
+      const nextPlacementDimensions = [
+        nextPreviewNode.width,
+        (nextPreviewNode.showPlinth ? nextPreviewNode.plinthHeight : 0) +
+          nextPreviewNode.carcassHeight +
+          (nextPreviewNode.withCountertop ? nextPreviewNode.countertopThickness : 0),
+        nextPreviewNode.depth + (islandModeRef.current ? ISLAND_SEATING_OVERHANG : 0),
+      ] as [number, number, number]
+      placementDimensionsRef.current = nextPlacementDimensions
+      const sideAndFrontOverhang = nextPreviewNode.withCountertop
+        ? nextPreviewNode.countertopOverhang
+        : 0
+      placementSnapFootprintRef.current = {
+        dimensions: [
+          nextPreviewNode.width + sideAndFrontOverhang * 2,
+          nextPlacementDimensions[1],
+          nextPreviewNode.depth +
+            sideAndFrontOverhang +
+            (islandModeRef.current ? ISLAND_SEATING_OVERHANG : 0),
+        ],
+        offset: [
+          0,
+          (sideAndFrontOverhang - (islandModeRef.current ? ISLAND_SEATING_OVERHANG : 0)) / 2,
+        ],
+      }
     }
 
     const onDoubleClick = (event: FloorPlacementClickTriggerEvent) => {
@@ -851,7 +1585,14 @@ const CabinetTool = () => {
       stopPlacementCommitPropagation(event)
     }
 
-    const onClick = (event: FloorPlacementClickTriggerEvent) => {
+    // Returns true when a cabinet (or insertion) was actually committed —
+    // `fromTypedCommit` marks the synthetic Enter-commit call, which manages
+    // the typing session itself in its caller.
+    const onClickInner = (
+      event: FloorPlacementClickTriggerEvent,
+      fromTypedCommit = false,
+      rawOverride?: [number, number, number],
+    ): boolean => {
       const anchor = resolveDraftAnchor()
       if (anchor) {
         const detail =
@@ -861,17 +1602,17 @@ const CabinetTool = () => {
         if (isCabinetContinuousFollowUpClick(detail)) {
           clearDraft()
           stopPlacementCommitPropagation(event)
-          return
+          return false
         }
         const segment = resolveCurrentDraftSegment(anchor, event)
         if (!segment) {
           stopPlacementCommitPropagation(event)
-          return
+          return false
         }
         const committed = commitDraftSegment(segment)
         if (!committed) {
           stopPlacementCommitPropagation(event)
-          return
+          return false
         }
         chainRootRunRef.current ??= committed.run
         chainRunRef.current = committed.run
@@ -879,21 +1620,37 @@ const CabinetTool = () => {
         chainCornerSideRef.current = cabinetStretchExitSide(segment.stretch)
         draftAnchorRef.current = createCabinetContinuousContinuation({
           anchor: segment.anchor,
-          previewDepth: previewNode.depth,
-          previewWidth: previewNode.width,
+          previewDepth: previewNodeRef.current.depth,
+          previewWidth: previewNodeRef.current.width,
           stretch: segment.stretch,
         })
         publishPlacement(resolveActiveStretchPlacement(draftAnchorRef.current, event))
         triggerSFX('sfx:item-place')
         stopPlacementCommitPropagation(event)
-        return
+        return true
       }
       const next = isForcePlacementEvent(event)
         ? resolvePlacement(event)
         : (placementRef.current ?? resolvePlacement(event))
       if (!next.valid) {
         stopPlacementCommitPropagation(event)
-        return
+        return false
+      }
+      if (next.insertionPreview) {
+        const insertedId = commitInsertion(next)
+        if (!insertedId) {
+          stopPlacementCommitPropagation(event)
+          return false
+        }
+        useViewer.getState().setSelection({ selectedIds: [insertedId] })
+        useEditor.getState().setMode('select')
+        triggerSFX('sfx:item-place')
+        useAlignmentGuides.getState().clear()
+        usePlacementPreview.getState().clear()
+        clearPlacementSurface()
+        useFacingPose.getState().clear()
+        stopPlacementCommitPropagation(event)
+        return true
       }
       if (useEditor.getState().getContinuation('cabinet') === 'continuous') {
         draftSegmentsRef.current = []
@@ -906,32 +1663,452 @@ const CabinetTool = () => {
           position: next.position,
           yaw: next.yaw,
           snappedToWall: next.snappedToWall,
+          wallId: next.wallId,
+          wallLocalX: next.wallLocalX,
           wallSurfaceNormal: next.wallSurfaceNormal,
         }
-        publishPlacement(resolveStretchedPlacement(draftAnchorRef.current, event))
+        // Typed entry commits at the typed pose: seed the stretch preview
+        // there (zero-length) instead of growing toward the stale cursor
+        // position carried by the reused pointer event.
+        publishPlacement(
+          rawOverride
+            ? resolveStretchedPlacement(draftAnchorRef.current, event, rawOverride)
+            : resolveStretchedPlacement(draftAnchorRef.current, event),
+        )
         triggerSFX('sfx:item-pick')
         stopPlacementCommitPropagation(event)
-        return
+        return true
       }
       const { cabinet, buildModule } = buildRunNodes(next.position, next.yaw)
-      const module = buildModule(0, previewNode.width, 0)
+      const module = buildModule(0, previewNodeRef.current.width, 0)
+      const nodes = { ...useScene.getState().nodes, [cabinet.id]: cabinet, [module.id]: module }
+      const committedCabinet = CabinetNode.parse({
+        ...cabinet,
+        ...resolveSupportSlabPatch(cabinet, nodes),
+      })
       useScene.getState().createNodes([
-        { node: cabinet, parentId: activeLevelId },
-        { node: module, parentId: cabinet.id },
+        { node: committedCabinet, parentId: activeLevelId },
+        { node: module, parentId: committedCabinet.id },
       ])
-      bumpCabinetRunsNearNewRun(cabinet.id as AnyNodeId)
+      bumpCabinetRunsNearNewRun(committedCabinet.id as AnyNodeId)
       useViewer.getState().setSelection({ selectedIds: [module.id] })
       useEditor.getState().setMode('select')
       triggerSFX('sfx:item-place')
+      useAlignmentGuides.getState().clear()
       usePlacementPreview.getState().clear()
+      usePlacementTyping.getState().clear()
+      typedWallHitRef.current = null
+      typedCoordinateDefaultsRef.current = null
       clearPlacementSurface()
       useFacingPose.getState().clear()
       stopPlacementCommitPropagation(event)
+      return true
+    }
+
+    // Canvas clicks land here. A click during typed entry commits the typed
+    // preview (what the user sees); the session is only ended when the
+    // commit actually succeeds — an invalid typed pose keeps the session
+    // alive so the values can still be edited.
+    const onClick = (
+      event: FloorPlacementClickTriggerEvent,
+      fromTypedCommit = false,
+      rawOverride?: [number, number, number],
+    ): boolean => {
+      const typingActive = !fromTypedCommit && usePlacementTyping.getState().isActive
+      const committed = onClickInner(event, fromTypedCommit, rawOverride)
+      if (typingActive && committed) {
+        suppressTypedRestoreRef.current = true
+        usePlacementTyping.getState().clear()
+        typedWallHitRef.current = null
+        typedCoordinateDefaultsRef.current = null
+      }
+      return committed
+    }
+
+    const applyTypedPlacement = () => {
+      const typing = usePlacementTyping.getState()
+      const current = placementRef.current
+      const hit = typedWallHitRef.current
+      const defaults = typedCoordinateDefaultsRef.current
+      if (!typing.isActive || !current || !hit || !defaults || current.stretch) return false
+
+      const lengthOptions = placementTypingLengthOptions(unit, metricNotation)
+      const parseTypedValue = (raw: string, fallback: number) =>
+        raw.trim()
+          ? parseMeasurement(raw, { kind: 'length', unitId: 'm' }, lengthOptions)
+          : fallback
+      const distance = parseTypedValue(typing.fields[0], defaults[0])
+      const offset = parseTypedValue(typing.fields[1], defaults[1])
+      if (distance == null || offset == null) return false
+
+      const resolved = resolveCabinetTypedPlacementPosition({
+        depth: previewNodeRef.current.depth,
+        distance,
+        hit,
+        levelId: activeLevelId,
+        nodes: useScene.getState().nodes,
+        offset,
+        position: current.position,
+        width: previewNodeRef.current.width,
+      })
+      if (!resolved) return false
+
+      // Typed entry targets an exact wall position. Drop any run-insertion
+      // preview captured by the pointer path — otherwise Enter re-enters the
+      // `onClick` insertion branch and commits the original run slot instead
+      // of the typed coordinates.
+      const {
+        conflictIds: _conflictIds,
+        insertionFailure: _insertionFailure,
+        insertionPreview: _insertionPreview,
+        valid: _valid,
+        ...placementBase
+      } = current
+      const next = withPlacementValidity(
+        {
+          ...placementBase,
+          position: resolved.position,
+          wallLocalX: resolved.wallLocalX,
+          yaw: resolved.yaw,
+          wallSurfaceNormal: [Math.sin(resolved.yaw), 0, Math.cos(resolved.yaw)],
+          snappedToWall: true,
+        },
+        false,
+      )
+      placementRef.current = next
+      setPlacement(next)
+      usePlacementTyping.getState().setProjectedPosition(next.position)
+      publishFloorplanPreview(next)
+      return true
+    }
+
+    const beginTypedPlacement = (activeField: PlacementTypingField) => {
+      const current = placementRef.current
+      if (!current || current.stretch || !current.snappedToWall || !current.wallId) return false
+      const nodes = useScene.getState().nodes
+      const excludedWallIds = Object.values(nodes as Record<AnyNodeId, AnyNode>)
+        .filter((node): node is WallNode => node.type === 'wall' && node.id !== current.wallId)
+        .map((node) => node.id as AnyNodeId)
+      const hit = findClosestCabinetWallInPlan({
+        excludeIds: excludedWallIds,
+        // The placement already knows its wall; a typed perpendicular offset
+        // can push the cabinet center beyond the normal snap distance, so
+        // don't cap the projection — just make sure the closest wall is the
+        // one we're attached to.
+        maxDistance: Infinity,
+        nodes,
+        parentLevelId: activeLevelId,
+        planPoint: [current.position[0], current.position[2]],
+      })
+      if (!hit || hit.wall.id !== current.wallId) return false
+
+      const coordinates = getCabinetPlacementCoordinates({
+        depth: previewNodeRef.current.depth,
+        hit,
+        levelId: activeLevelId,
+        nodes,
+        position: current.position,
+        width: previewNodeRef.current.width,
+      })
+      typedWallHitRef.current = hit
+      typedCoordinateDefaultsRef.current = [coordinates.distance, coordinates.offset]
+      suppressTypedRestoreRef.current = false
+      usePlacementTyping.getState().begin({
+        labels: PLACEMENT_TYPING_DISTANCE_OFFSET,
+        fieldDefaults: [
+          formatLinearMeasurement(coordinates.distance, unit, metricNotation),
+          formatLinearMeasurement(coordinates.offset, unit, metricNotation),
+        ],
+        activeField,
+      })
+      return true
+    }
+
+    let handledSubmitRevision = usePlacementTyping.getState().submitRevision
+    let previousTypingFields = usePlacementTyping.getState().fields
+    let previousTypingField = usePlacementTyping.getState().activeField
+    let previousTypingActive = usePlacementTyping.getState().isActive
+    const unsubscribePlacementTyping = usePlacementTyping.subscribe(
+      (state: PlacementTypingState) => {
+        const fieldsChanged =
+          state.fields[0] !== previousTypingFields[0] || state.fields[1] !== previousTypingFields[1]
+        const activeFieldChanged = state.activeField !== previousTypingField
+        const becameActive = state.isActive && !previousTypingActive
+        const becameInactive = !state.isActive && previousTypingActive
+        previousTypingFields = state.fields
+        previousTypingField = state.activeField
+        previousTypingActive = state.isActive
+
+        if (state.isActive && (fieldsChanged || activeFieldChanged || becameActive)) {
+          applyTypedPlacement()
+        }
+        // Any exit path (Escape in the HUD input, tool cancel, commit) must
+        // drop the frozen wall hit — otherwise pointer moves keep feeding it
+        // into `publishFloorplanPreview`. An uncommitted exit re-resolves
+        // placement from the last pointer event so `placementRef` does not
+        // stay stuck at the cancelled typed pose.
+        if (becameInactive) {
+          typedWallHitRef.current = null
+          typedCoordinateDefaultsRef.current = null
+          if (!suppressTypedRestoreRef.current && lastPlacementEventRef.current) {
+            const event = lastPlacementEventRef.current
+            const anchor = resolveDraftAnchor()
+            const next = anchor
+              ? resolveActiveStretchPlacement(anchor, event)
+              : resolvePlacement(event)
+            publishPlacement(next)
+          }
+          suppressTypedRestoreRef.current = false
+        }
+        if (state.submitRevision === handledSubmitRevision) return
+        handledSubmitRevision = state.submitRevision
+        if (!applyTypedPlacement()) return
+
+        // Typed commits must honor the typed pose. Reusing the last pointer
+        // event in continuous mode would replay a stale `altKey` into
+        // `isForcePlacementEvent` and re-resolve placement from the old
+        // cursor hit instead of the typed distance/offset. `node` is also
+        // stripped: `stopPlacementCommitPropagation` installs a 300ms
+        // window click swallow for real wall hits, which would eat the
+        // user's next real click after this keyboard commit.
+        const baseCommitEvent =
+          useEditor.getState().getContinuation('cabinet') === 'continuous'
+            ? (lastPlacementEventRef.current ??
+              ({ nativeEvent: {} } as FloorPlacementClickTriggerEvent))
+            : ({ nativeEvent: {} } as FloorPlacementClickTriggerEvent)
+        const { node: _node, ...baseEventWithoutNode } = baseCommitEvent as NodeEvent<AnyNode>
+        const commitEvent: FloorPlacementClickTriggerEvent = {
+          ...baseEventWithoutNode,
+          nativeEvent: { ...(baseCommitEvent.nativeEvent ?? {}), altKey: false },
+        }
+        // Seed any continuous-mode stretch at the typed position (zero-length
+        // span), not the stale cursor carried by the reused pointer event.
+        // Restore is suppressed: a successful commit owns the placement, and
+        // `onClick`'s internal `clear()` would otherwise re-trigger the
+        // restore logic below and revert the fresh stretch anchor.
+        const typedPosition = placementRef.current?.position
+        suppressTypedRestoreRef.current = true
+        const committed = onClick(commitEvent, true, typedPosition)
+        // Keep the typed values when the pose was rejected (e.g. collision)
+        // so Enter does not silently wipe the session — the user can adjust
+        // distance/offset and retry.
+        if (!committed) {
+          suppressTypedRestoreRef.current = false
+          return
+        }
+        typedWallHitRef.current = null
+        typedCoordinateDefaultsRef.current = null
+        usePlacementTyping.getState().clear()
+      },
+    )
+
+    const applyTypedDimension = () => {
+      const editor = usePlacementPreview.getState()
+      const current = placementRef.current
+      if (!(editor.activeDimensionId && editor.dimensionInput && current)) {
+        return false
+      }
+      const value = parseCabinetDimensionInput(editor.dimensionInput, {
+        locale,
+        metricNotation,
+        unit,
+      })
+      if (value === null) return false
+      if (!current.stretch) {
+        const sizeField =
+          editor.activeDimensionId === 'cabinet-width'
+            ? 'width'
+            : editor.activeDimensionId === 'cabinet-depth'
+              ? 'depth'
+              : editor.activeDimensionId === 'cabinet-height'
+                ? 'height'
+                : null
+        if (sizeField) {
+          const limits =
+            sizeField === 'width'
+              ? { max: 3, min: 0.3 }
+              : sizeField === 'depth'
+                ? { max: 1.2, min: 0.3 }
+                : { max: 1.4, min: 0.4 }
+          const nextValue = Math.min(limits.max, Math.max(limits.min, value))
+          updatePreviewSize(sizeField, nextValue)
+          let position = current.position
+          let wallLocalX = current.wallLocalX
+          if (current.snappedToWall && current.wallId) {
+            const resolvedWallPosition = resolveCabinetPlacementDimensionPosition({
+              depth: previewNodeRef.current.depth,
+              dimensionId: 'wall-clearance',
+              levelId: activeLevelId,
+              nodes: useScene.getState().nodes,
+              position: current.position,
+              rotation: current.yaw,
+              wallId: current.wallId,
+              value: 0,
+              width: previewNodeRef.current.width,
+            })
+            if (resolvedWallPosition) {
+              position = resolvedWallPosition.position
+              wallLocalX = resolvedWallPosition.wallLocalX
+            }
+          }
+          const { conflictIds: _conflictIds, valid: _valid, ...placementBase } = current
+          const next = withPlacementValidity(
+            {
+              ...placementBase,
+              position,
+              ...(wallLocalX == null ? {} : { wallLocalX }),
+            },
+            false,
+          )
+          placementRef.current = next
+          setPlacement(next)
+          publishFloorplanPreview(next)
+          editor.clearDimensionEditor()
+          return true
+        }
+      }
+      if (current.stretch && current.stretchAnchor) {
+        const spanPosition = runLocalToPlan({ position: current.position, rotation: current.yaw }, [
+          current.stretch.centerLocalX,
+          0,
+          0,
+        ])
+        const resolved = resolveCabinetPlacementDimensionPosition({
+          depth: previewNodeRef.current.depth,
+          dimensionId: editor.activeDimensionId,
+          levelId: activeLevelId,
+          nodes: useScene.getState().nodes,
+          position: spanPosition,
+          rotation: current.yaw,
+          wallId: current.wallId,
+          value,
+          width: current.stretch.length,
+        })
+        if (!resolved) return false
+        const anchorPosition = runLocalToPlan(
+          { position: resolved.position, rotation: current.yaw },
+          [-current.stretch.centerLocalX, 0, 0],
+        )
+        const nextAnchor = {
+          ...current.stretchAnchor,
+          position: anchorPosition,
+          ...(current.wallId && current.wallLocalX != null
+            ? { wallLocalX: resolved.wallLocalX - current.stretch.centerLocalX }
+            : {}),
+        }
+        const validity = resolveStretchedValidity(nextAnchor, current.stretch, false)
+        const next = {
+          ...current,
+          conflictIds: validity.conflictIds,
+          position: anchorPosition,
+          stretchAnchor: nextAnchor,
+          valid: validity.valid,
+          ...(current.wallId && current.wallLocalX != null
+            ? { wallLocalX: resolved.wallLocalX - current.stretch.centerLocalX }
+            : {}),
+        }
+        placementRef.current = next
+        setPlacement(next)
+        publishFloorplanPreview(next)
+        editor.clearDimensionEditor()
+        return true
+      }
+      const resolved = resolveCabinetPlacementDimensionPosition({
+        depth: previewNodeRef.current.depth,
+        dimensionId: editor.activeDimensionId,
+        levelId: activeLevelId,
+        nodes: useScene.getState().nodes,
+        position: current.position,
+        rotation: current.yaw,
+        wallId: current.wallId,
+        value,
+        width: previewNodeRef.current.width,
+      })
+      if (!resolved) return false
+      const { conflictIds: _conflictIds, valid: _valid, ...placementBase } = current
+      const next = withPlacementValidity(
+        {
+          ...placementBase,
+          position: resolved.position,
+          wallLocalX: resolved.wallLocalX,
+        },
+        false,
+      )
+      placementRef.current = next
+      setPlacement(next)
+      publishFloorplanPreview(next)
+      editor.clearDimensionEditor()
+      return true
     }
 
     const onKeyDown = (event: KeyboardEvent) => {
-      const tag = (event.target as HTMLElement | null)?.tagName
-      if (tag === 'INPUT' || tag === 'TEXTAREA') return
+      if (isTypingTarget(event.target)) return
+      const dimensionEditor = usePlacementPreview.getState()
+      const typingOutcome = routePlacementTypingKey(event, {
+        begin: (field) => !dimensionEditor.activeDimensionId && beginTypedPlacement(field),
+      })
+      if (typingOutcome) {
+        if (typingOutcome === 'commit') usePlacementTyping.getState().requestCommit()
+        if (typingOutcome === 'clear') {
+          typedWallHitRef.current = null
+          typedCoordinateDefaultsRef.current = null
+        }
+        event.preventDefault()
+        event.stopPropagation()
+        return
+      }
+      if (event.key === 'Tab' && dimensionEditor.dimensions.length > 0) {
+        const currentIndex = dimensionEditor.dimensions.findIndex(
+          (dimension) => dimension.id === dimensionEditor.activeDimensionId,
+        )
+        const direction = event.shiftKey ? -1 : 1
+        const nextIndex =
+          (currentIndex + direction + dimensionEditor.dimensions.length) %
+          dimensionEditor.dimensions.length
+        dimensionEditor.selectDimension(dimensionEditor.dimensions[nextIndex]!.id)
+        event.preventDefault()
+        event.stopPropagation()
+        return
+      }
+      if (dimensionEditor.activeDimensionId && placementRef.current) {
+        if (event.key === 'Enter') {
+          applyTypedDimension()
+          event.preventDefault()
+          event.stopPropagation()
+          return
+        }
+        if (event.key === 'Escape') {
+          dimensionEditor.clearDimensionEditor()
+          event.preventDefault()
+          event.stopPropagation()
+          return
+        }
+        if (event.key === 'Backspace' || event.key === 'Delete') {
+          dimensionEditor.setDimensionInput(
+            event.key === 'Delete'
+              ? ''
+              : dimensionEditor.dimensionInput.slice(
+                  0,
+                  Math.max(0, dimensionEditor.dimensionInput.length - 1),
+                ),
+          )
+          event.preventDefault()
+          event.stopPropagation()
+          return
+        }
+        if (
+          event.key.length === 1 &&
+          !event.metaKey &&
+          !event.ctrlKey &&
+          !event.altKey &&
+          /^[0-9a-zA-Z.'"+\- ]$/.test(event.key)
+        ) {
+          dimensionEditor.setDimensionInput(dimensionEditor.dimensionInput + event.key)
+          event.preventDefault()
+          event.stopPropagation()
+          return
+        }
+      }
       if (event.key === 'i' || event.key === 'I') {
         event.preventDefault()
         event.stopPropagation()
@@ -950,7 +2127,18 @@ const CabinetTool = () => {
         !placementRef.current.snappedToWall &&
         !placementRef.current.stretch
       ) {
-        const next = { ...placementRef.current, yaw: yawRef.current }
+        const current = placementRef.current
+        const { conflictIds: _conflictIds, valid: _valid, ...placementBase } = current
+        const raw = lastRawPositionRef.current ?? current.position
+        const position = resolveAlignedCabinetPosition({
+          applyAlignmentSnap: isMagneticSnapActive(),
+          position: resolveGridPosition(raw),
+          yaw: yawRef.current,
+        })
+        const next = withPlacementValidity(
+          { ...placementBase, position, yaw: yawRef.current },
+          false,
+        )
         placementRef.current = next
         setPlacement(next)
         publishFloorplanPreview(next)
@@ -959,6 +2147,13 @@ const CabinetTool = () => {
     }
 
     const onCancel = () => {
+      if (usePlacementTyping.getState().isActive) {
+        markToolCancelConsumed()
+        usePlacementTyping.getState().clear()
+        typedWallHitRef.current = null
+        typedCoordinateDefaultsRef.current = null
+        return
+      }
       if (!draftAnchorRef.current) return
       markToolCancelConsumed()
       clearDraft()
@@ -978,18 +2173,31 @@ const CabinetTool = () => {
       emitter.off('wall:move', onWallMove)
       emitter.off('tool:cancel', onCancel)
       unsubscribeCabinetPlacementType()
+      unsubscribePlacementTyping()
       unsubscribePlacementClicks()
       unsubscribePlacementDoubleClicks()
       window.removeEventListener('keydown', onKeyDown, true)
       draftAnchorRef.current = null
       usePlacementPreview.getState().clear()
+      usePlacementTyping.getState().clear()
+      typedWallHitRef.current = null
+      typedCoordinateDefaultsRef.current = null
       clearPlacementSurface()
       useFacingPose.getState().clear()
+      useAlignmentGuides.getState().clear()
       useCabinetPlacementStatus.getState().setBlocked(false)
     }
-  }, [activeLevelId, placementDimensions, previewNode, publishFloorplanPreview])
+  }, [
+    activeLevelId,
+    metricNotation,
+    previewNode,
+    publishFloorplanPreview,
+    toolDefaults,
+    unit,
+    wallCabinet,
+  ])
 
-  if (!activeLevelId || !placement) return null
+  if (!(activeLevelId && placement)) return null
   const stretch = placement.stretch
   const draftModuleOffsets = draftSegments.map((segment, segmentIndex) =>
     draftSegments
@@ -1000,19 +2208,23 @@ const CabinetTool = () => {
     (sum, segment) => sum + segment.stretch.modules.length,
     0,
   )
-  const placementLabel = stretch
-    ? placement.valid
-      ? `${draftSegments.length + 1} leg${draftSegments.length + 1 === 1 ? '' : 's'} · ${stretch.modules.length} module${stretch.modules.length === 1 ? '' : 's'} · Click to continue · Double-click/Esc to finish`
-      : null
-    : !placement.valid
-      ? null
-      : placement.snappedToWall
-        ? placement.snapReason === 'cabinet-edge'
-          ? 'Edge snap'
-          : placement.snapReason === 'corner'
-            ? 'Corner snap'
-            : 'Wall snap'
-        : null
+  const placementLabel = placement.insertionFailure
+    ? 'No space in this run to insert this cabinet'
+    : placement.neighborJoin
+      ? `${placement.valid ? 'Join' : 'Blocked beside'} ${placement.neighborJoin.name} · ${placement.neighborJoin.side} side · Depth matched`
+      : stretch
+        ? placement.valid
+          ? `${draftSegments.length + 1} leg${draftSegments.length + 1 === 1 ? '' : 's'} · ${stretch.modules.length} module${stretch.modules.length === 1 ? '' : 's'} · Click to continue · Double-click/Esc to finish`
+          : null
+        : placement.valid
+          ? placement.snappedToWall
+            ? placement.snapReason === 'cabinet-edge'
+              ? 'Edge snap'
+              : placement.snapReason === 'corner'
+                ? 'Corner snap'
+                : 'Wall snap'
+            : `Place ${previewNode.name ?? 'cabinet'}`
+          : null
   const labelPosition = stretch
     ? runLocalToPlan({ position: placement.position, rotation: placement.yaw }, [
         stretch.centerLocalX,
@@ -1031,19 +2243,19 @@ const CabinetTool = () => {
     rotation: placement.yaw,
     levelId: activeLevelId,
   })
-  const placementRotationY = placement.snappedToWall || stretch ? placement.yaw : yaw
+  const placementRotationY =
+    placement.snappedToWall || stretch || placement.neighborJoin ? placement.yaw : yaw
   const placementBoxDimensions: [number, number, number] = [
-    stretch ? stretch.length : placementDimensions[0],
-    placementDimensions[1],
-    placementDimensions[2],
+    stretch
+      ? stretch.length + (previewNode.withCountertop ? previewNode.countertopOverhang * 2 : 0)
+      : placementSnapFootprint.dimensions[0],
+    placementSnapFootprint.dimensions[1],
+    placement.neighborJoin?.depth ?? placementSnapFootprint.dimensions[2],
   ]
-  const placementBoxPlanPosition = stretch
-    ? runLocalToPlan({ position: placement.position, rotation: placement.yaw }, [
-        stretch.centerLocalX,
-        0,
-        0,
-      ])
-    : placement.position
+  const placementBoxPlanPosition = runLocalToPlan(
+    { position: placement.position, rotation: placement.yaw },
+    [stretch?.centerLocalX ?? 0, 0, placementSnapFootprint.offset[1]],
+  )
   const placementBoxPosition: [number, number, number] = [
     placementBoxPlanPosition[0],
     visualPosition[1],
@@ -1054,12 +2266,27 @@ const CabinetTool = () => {
     <LevelOffsetGroup>
       {placement.guide && <WallSnapGuide blocked={!placement.valid} guide={placement.guide} />}
       <PlacementBox
+        activeDimensionId={stretch ? null : activeDimensionId}
+        dimensionInput={dimensionInput}
         dimensions={placementBoxDimensions}
-        measurements={{ unit }}
+        measurements={{ unit, metricNotation }}
+        measurementValues={
+          stretch
+            ? undefined
+            : [
+                previewNode.width,
+                previewNode.carcassHeight,
+                placement.neighborJoin?.depth ?? previewNode.depth,
+              ]
+        }
+        onDimensionSelect={
+          stretch ? undefined : (id) => usePlacementPreview.getState().selectDimension(id)
+        }
         position={placementBoxPosition}
         rotationY={placementRotationY}
         valid={placement.valid}
       />
+      <PlacementDimensionGuides />
       {draftSegments.map((segment, segmentIndex) => (
         <group
           key={`draft-${segmentIndex}`}
@@ -1077,8 +2304,14 @@ const CabinetTool = () => {
           ))}
         </group>
       ))}
-      <group ref={activeGhostRef} position={visualPosition} rotation={[0, placementRotationY, 0]}>
-        {stretch ? (
+      <group position={visualPosition} ref={activeGhostRef} rotation={[0, placementRotationY, 0]}>
+        {placement.insertionPreview ? (
+          <group
+            scale={[1, 1, (placement.neighborJoin?.depth ?? previewNode.depth) / previewNode.depth]}
+          >
+            <primitive object={insertionGhost as Group} />
+          </group>
+        ) : stretch ? (
           stretch.modules.map((module, index) => (
             <group
               key={index}
@@ -1092,6 +2325,36 @@ const CabinetTool = () => {
           <primitive object={ghost as Group} />
         )}
       </group>
+      {placement.insertionPreview && !placement.neighborJoin ? (
+        <group
+          position={placement.insertionPreview.runPosition}
+          rotation={[0, placement.insertionPreview.runYaw, 0]}
+        >
+          {placement.insertionPreview.modules.map((module, index) => (
+            <group
+              key={module.id}
+              position={module.position}
+              scale={[module.width / previewNode.width, 1, 1]}
+            >
+              <primitive object={insertionGhostForIndex(index + 1)} />
+            </group>
+          ))}
+        </group>
+      ) : null}
+      {typingActive && !stretch && placement.snappedToWall ? (
+        <LocalizedHtml
+          center
+          position={[
+            typingProjectedPosition?.[0] ?? placement.position[0],
+            visualPosition[1] + previewNode.carcassHeight + 0.45,
+            typingProjectedPosition?.[2] ?? placement.position[2],
+          ]}
+          style={{ pointerEvents: 'auto', userSelect: 'none' }}
+          zIndexRange={[200, 0]}
+        >
+          <PlacementCoordinateInput />
+        </LocalizedHtml>
+      ) : null}
       {placementLabel ? (
         <Html
           center
@@ -1118,4 +2381,9 @@ const CabinetTool = () => {
   )
 }
 
-export default CabinetTool
+// Remount when the chosen item changes so typed dimensions and drafts cannot leak
+// from a base cabinet into a fridge or an overhead cabinet.
+export default function CabinetTool() {
+  const preset = useEditor((state) => state.toolDefaults.cabinet?.kitchenPreset)
+  return <CabinetPlacementTool key={String(preset ?? 'base-door')} />
+}

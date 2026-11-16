@@ -1,11 +1,14 @@
-import { afterEach, describe, expect, test } from 'bun:test'
+import { afterEach, beforeEach, describe, expect, test } from 'bun:test'
 import type { AnyNode } from '@pascal-app/core'
 import {
   type ActiveInteractionScope,
+  curveReshapeScope,
   editingHoleInfo,
   handleDragInfo,
   isActive,
   isIdle,
+  isToolDrivenReshape,
+  meshEditScope,
   scopeNodeId,
   selectionEnabled,
 } from '../lib/interaction/scope'
@@ -18,6 +21,7 @@ const mockNode = (id: string, type: string): AnyNode => ({ id, type }) as unknow
 function reset() {
   useInteractionScope.getState().end()
 }
+beforeEach(reset)
 afterEach(reset)
 
 describe('use-interaction-scope state machine', () => {
@@ -69,6 +73,7 @@ describe('use-interaction-scope state machine', () => {
       nodeType: 'item',
       view: '3d',
       pressDrag: false,
+      driver: 'move-tool',
     })
     s.update({ pressDrag: true })
     const scope = useInteractionScope.getState().scope
@@ -102,6 +107,7 @@ describe('use-interaction-scope state machine', () => {
       nodeType: 'item',
       view: '3d',
       pressDrag: true,
+      driver: 'move-tool',
     })
     expect(useInteractionScope.getState().scope.kind).toBe('moving')
   })
@@ -112,6 +118,22 @@ describe('use-interaction-scope state machine', () => {
     s.begin({ kind: 'box-select' })
     expect(selectionEnabled(useInteractionScope.getState().scope)).toBe(false)
     expect(isActive(useInteractionScope.getState().scope)).toBe(true)
+  })
+
+  test('mesh edit mode owns its node and disables scene selection for the full session', () => {
+    const s = useInteractionScope.getState()
+    s.begin(meshEditScope('block_1'))
+    expect(scopeNodeId(useInteractionScope.getState().scope)).toBe('block_1')
+    expect(selectionEnabled(useInteractionScope.getState().scope)).toBe(false)
+
+    s.begin(meshEditScope('block_1', 'operating', 'translate'))
+    expect(useInteractionScope.getState().scope).toEqual({
+      kind: 'mesh-editing',
+      nodeId: 'block_1',
+      phase: 'operating',
+      operator: 'translate',
+    })
+    expect(selectionEnabled(useInteractionScope.getState().scope)).toBe(false)
   })
 
   test('end is idempotent', () => {
@@ -137,7 +159,13 @@ describe('derived flag views are leak-free (no parallel flags)', () => {
 
   test('editingHoleInfo mirrors a hole reshape and clears on end', () => {
     const s = useInteractionScope.getState()
-    s.begin({ kind: 'reshaping', nodeId: 'slab_1', reshape: 'hole', holeIndex: 2 })
+    s.begin({
+      kind: 'reshaping',
+      nodeId: 'slab_1',
+      reshape: 'hole',
+      driver: 'tool',
+      holeIndex: 2,
+    })
     expect(editingHoleInfo(scope())).toEqual({ nodeId: 'slab_1', holeIndex: 2 })
     s.end()
     expect(editingHoleInfo(scope())).toBeNull()
@@ -145,8 +173,13 @@ describe('derived flag views are leak-free (no parallel flags)', () => {
 
   test('a non-hole reshape never reads as an editing hole', () => {
     const s = useInteractionScope.getState()
-    s.begin({ kind: 'reshaping', nodeId: 'wall_1', reshape: 'curve' })
+    s.begin({ kind: 'reshaping', nodeId: 'wall_1', reshape: 'curve', driver: 'tool' })
     expect(editingHoleInfo(scope())).toBeNull()
+  })
+
+  test('a floorplan-owned curve drag does not activate the registry reshape tool', () => {
+    expect(isToolDrivenReshape(curveReshapeScope('wall_1', 'floorplan'))).toBe(false)
+    expect(isToolDrivenReshape(curveReshapeScope('wall_1', 'tool'))).toBe(true)
   })
 
   test('switching interactions never leaks the prior derived view', () => {
@@ -154,7 +187,13 @@ describe('derived flag views are leak-free (no parallel flags)', () => {
     s.begin({ kind: 'handle-drag', nodeId: 'wall_1', handle: 'height' })
     // Single-owner replacement: the handle-drag view must vanish the instant a
     // different interaction begins — the two cannot be simultaneously active.
-    s.begin({ kind: 'reshaping', nodeId: 'slab_1', reshape: 'hole', holeIndex: 0 })
+    s.begin({
+      kind: 'reshaping',
+      nodeId: 'slab_1',
+      reshape: 'hole',
+      driver: 'tool',
+      holeIndex: 0,
+    })
     expect(handleDragInfo(scope())).toBeNull()
     expect(editingHoleInfo(scope())).toEqual({ nodeId: 'slab_1', holeIndex: 0 })
   })
@@ -169,11 +208,14 @@ describe('derived flag views are leak-free (no parallel flags)', () => {
         nodeType: 'item',
         view: '3d',
         pressDrag: false,
+        driver: 'move-tool',
       },
       { kind: 'moving', node: mockNode('i', 'item'), nodeId: 'i', nodeType: 'item', view: '3d' },
       { kind: 'drafting', tool: 'wall' },
+      { kind: 'mesh-editing', nodeId: 'mesh_1', phase: 'selecting' },
       { kind: 'box-select' },
       { kind: 'painting' },
+      { kind: 'sculpting' },
     ]
     for (const k of kinds) {
       s.begin(k)

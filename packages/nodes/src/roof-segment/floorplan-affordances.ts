@@ -2,18 +2,35 @@ import {
   type AnyNodeId,
   type FloorplanAffordance,
   type FloorplanMoveTarget,
+  getRoofSegmentResizePatch,
+  MIN_ROOF_SEGMENT_DIMENSION,
   type RoofNode,
   type RoofSegmentNode,
   snapScalar,
+  useLiveNodeOverrides,
   useScene,
 } from '@pascal-app/core'
-import { getSegmentGridStep } from '@pascal-app/editor'
+import {
+  getSegmentGridStep,
+  isAngleSnapActive,
+  isGridSnapActive,
+  isMagneticSnapActive,
+} from '@pascal-app/editor'
+import { commitSeatedRoofEdit } from '../roof/roof-level-target'
+import {
+  bearingWallThickness,
+  catchRoofOnWalls,
+  catchRoofSideOnWalls,
+  placeRoofOnWalls,
+  roofCatchWalls,
+  segmentWallLine,
+} from '../roof/wall-catch'
 import { createFloorplanCursorResolver } from '../shared/floorplan-cursor'
 import { rotateAffordanceDelta } from '../shared/rotate-affordance'
 
-const MIN_ROOF_DIM = 1
+const MIN_ROOF_DIM = MIN_ROOF_SEGMENT_DIMENSION
 
-type RoofSegmentResizePayload = { axis: 'x' | 'z'; side: 1 | -1 }
+type RoofSegmentResizePayload = { mode: 'radial' } | { axis: 'x' | 'z'; side: 1 | -1 }
 
 // Resolve world-space center + effective rotation of a roof segment by
 // composing the parent roof's position + rotation with the segment's
@@ -52,19 +69,62 @@ function resolveSegmentFrame(
 
 /**
  * Roof-segment width / depth drag (floor-plan). Mirrors the 3D
- * `linear-resize` handles in `definition.ts` — `anchor: 'center'`
- * means dragging outward on either +/-X (or +/-Z) edge grows the
- * dimension by 2× the segment-local cursor offset while the segment's
- * roof-local position stays put. Projects the plan cursor onto the
- * segment's effective rotation (roof.rotation + segment.rotation) so
- * the math survives any parent-roof rotation.
+ * `linear-resize` handles in `definition.ts`: the dragged side moves
+ * while the opposite side stays fixed. Projects the plan cursor onto
+ * the segment's effective rotation (roof.rotation + segment.rotation)
+ * so the math survives any parent-roof rotation, then writes the
+ * corresponding roof-local center shift alongside the new dimension.
  */
 export const roofSegmentResizeAffordance: FloorplanAffordance<RoofSegmentNode> = {
   start({ node, payload, nodes, initialPlanPoint }) {
-    const { axis, side } = payload as RoofSegmentResizePayload
+    const resize = payload as RoofSegmentResizePayload
     const segmentId = node.id as AnyNodeId
+    const { cx, cz } = resolveSegmentFrame(node, nodes)
+    if ('mode' in resize) {
+      const initialRadius = node.width / 2
+      const initialPointerRadius = Math.hypot(initialPlanPoint[0] - cx, initialPlanPoint[1] - cz)
+      let lastRadius = initialRadius
+
+      return {
+        affectedIds: [segmentId],
+        apply({ planPoint }) {
+          const pointerRadius = Math.hypot(planPoint[0] - cx, planPoint[1] - cz)
+          lastRadius = Math.max(
+            MIN_ROOF_DIM / 2,
+            initialRadius + pointerRadius - initialPointerRadius,
+          )
+          const diameter = lastRadius * 2
+          useLiveNodeOverrides.getState().set(segmentId, { width: diameter, depth: diameter })
+          useScene.getState().markDirty(segmentId)
+        },
+        canCommit() {
+          return true
+        },
+        commit() {
+          useLiveNodeOverrides.getState().clear(segmentId)
+          const diameter = lastRadius * 2
+          // Grown onto the walls that carry it, its roof goes to the level above them.
+          commitSeatedRoofEdit(
+            [{ id: segmentId, data: { width: diameter, depth: diameter } }],
+            segmentId,
+          )
+        },
+      }
+    }
+
+    const { axis, side } = resize
     const initialValue = axis === 'x' ? node.width : node.depth
-    const { cx, cz, effRot } = resolveSegmentFrame(node, nodes)
+    const { effRot } = resolveSegmentFrame(node, nodes)
+    const roofId = (node as unknown as { parentId?: AnyNodeId | null }).parentId
+    const roof = roofId ? (nodes[roofId] as RoofNode | undefined) : undefined
+    const walls = roofCatchWalls(nodes, roof?.parentId)
+    const line = {
+      center: [cx, cz] as const,
+      angle: effRot,
+      hw: node.width / 2,
+      hd: node.depth / 2,
+      wallThickness: node.wallThickness,
+    }
     const cosEff = Math.cos(effRot)
     const sinEff = Math.sin(effRot)
     // Project (planPoint - center) onto the segment's local X or Z axis
@@ -77,31 +137,46 @@ export const roofSegmentResizeAffordance: FloorplanAffordance<RoofSegmentNode> =
     }
     const initialLocal = projectLocalAxis(initialPlanPoint[0], initialPlanPoint[1])
     let lastValue = initialValue
+    // Sized onto the walls under it, its gable and heel walls take their thickness; off them, it
+    // keeps its own (the live override merges, so it is always written).
+    const resized = (value: number): Partial<RoofSegmentNode> => {
+      const patch = getRoofSegmentResizePatch(node, axis, side, value)
+      const thickness = bearingWallThickness(
+        segmentWallLine(roof ?? { position: [0, 0, 0], rotation: 0 }, { ...node, ...patch }),
+        walls,
+      )
+      return { ...patch, wallThickness: thickness ?? node.wallThickness }
+    }
 
     return {
       affectedIds: [segmentId],
-      apply({ planPoint }) {
+      apply({ planPoint, modifiers }) {
         const currentLocal = projectLocalAxis(planPoint[0], planPoint[1])
         const delta = (currentLocal - initialLocal) * side
-        const rawValue = initialValue + 2 * delta
+        const rawValue = initialValue + delta
         // Mode-aware grid step (0 outside grid mode, so `lines` / `off` resize
         // freely — the "smooth" behaviour that used to need a held Shift). The
         // reshaping scope opened by the dispatcher resolves the `polygon` set.
-        const step = getSegmentGridStep()
-        const snappedValue = step > 0 ? snapScalar(rawValue, step) : rawValue
+        // Alt holds the raw cursor, as in 3D.
+        const free = modifiers.altKey
+        const step = !free && isGridSnapActive() ? getSegmentGridStep() : 0
+        let snappedValue = step > 0 ? snapScalar(rawValue, step) : rawValue
+        // The dragged side lands on a wall under it in grid and lines, as a move does.
+        if (!free && (isGridSnapActive() || isMagneticSnapActive())) {
+          snappedValue =
+            catchRoofSideOnWalls({ line, axis, side, value: rawValue, walls }) ?? snappedValue
+        }
         const newValue = Math.max(MIN_ROOF_DIM, snappedValue)
         lastValue = newValue
-        useScene
-          .getState()
-          .updateNode(segmentId, axis === 'x' ? { width: newValue } : { depth: newValue })
+        useLiveNodeOverrides.getState().set(segmentId, resized(newValue))
+        useScene.getState().markDirty(segmentId)
       },
       canCommit() {
         return true
       },
       commit() {
-        useScene
-          .getState()
-          .updateNode(segmentId, axis === 'x' ? { width: lastValue } : { depth: lastValue })
+        useLiveNodeOverrides.getState().clear(segmentId)
+        commitSeatedRoofEdit([{ id: segmentId, data: resized(lastValue) }], segmentId)
       },
     }
   },
@@ -125,21 +200,23 @@ export const roofSegmentRotateAffordance: FloorplanAffordance<RoofSegmentNode> =
 
     return {
       affectedIds: [segmentId],
-      apply({ planPoint, modifiers }) {
+      apply({ planPoint }) {
         const delta = rotateAffordanceDelta({
           center: [cx, cz],
           initialAngle,
           planPoint,
-          free: modifiers.shiftKey,
+          free: !isAngleSnapActive(),
         })
         lastRotation = initialRotation - delta
-        useScene.getState().updateNode(segmentId, { rotation: lastRotation })
+        useLiveNodeOverrides.getState().set(segmentId, { rotation: lastRotation })
+        useScene.getState().markDirty(segmentId)
       },
       canCommit() {
         return true
       },
       commit() {
-        useScene.getState().updateNode(segmentId, { rotation: lastRotation })
+        useLiveNodeOverrides.getState().clear(segmentId)
+        commitSeatedRoofEdit([{ id: segmentId, data: { rotation: lastRotation } }], segmentId)
       },
     }
   },
@@ -157,7 +234,7 @@ export const roofSegmentRotateAffordance: FloorplanAffordance<RoofSegmentNode> =
 export const roofSegmentMoveTarget: FloorplanMoveTarget<RoofSegmentNode> = ({ node, nodes }) => {
   const segmentId = node.id as AnyNodeId
   const initialY = node.position[1]
-  const { cx, cz, roofRot, cosRoof, sinRoof } = resolveSegmentFrame(node, nodes)
+  const { cx, cz, effRot, cosRoof, sinRoof } = resolveSegmentFrame(node, nodes)
   const roofId = (node as unknown as { parentId?: AnyNodeId | null }).parentId
   const roof = roofId ? (nodes[roofId] as RoofNode | undefined) : undefined
   const roofPosX = roof?.position[0] ?? 0
@@ -166,33 +243,65 @@ export const roofSegmentMoveTarget: FloorplanMoveTarget<RoofSegmentNode> = ({ no
     original: [cx, cz],
     metadata: node.metadata,
   })
-  // Inverse of the forward transform `[cosRoof, -sinRoof; sinRoof, cosRoof]`
-  // is `[cosRoof, sinRoof; -sinRoof, cosRoof]`. Used to project world cursor
-  // back into roof-local coords.
-  void roofRot
+  const walls = roofCatchWalls(nodes, roof?.parentId)
   let lastLocal: [number, number, number] = [node.position[0], node.position[1], node.position[2]]
+  // Off them again, it keeps its own (the live override merges, so it is always written).
+  let lastThickness = node.wallThickness
+  const moved = (): Partial<RoofSegmentNode> => ({
+    position: lastLocal,
+    wallThickness: lastThickness,
+  })
 
   return {
     affectedIds: [segmentId],
-    apply({ planPoint }) {
+    apply({ planPoint, modifiers }) {
       // Mode-aware: `getSegmentGridStep()` is 0 outside grid mode (so `lines` /
       // `off` move freely), and the `moving` scope resolves the `polygon` set
-      // via the kind's `snapProfile` — no held-Shift bypass.
-      const step = getSegmentGridStep()
+      // via the kind's `snapProfile` — no held-Shift bypass. Alt holds the raw cursor, as in 3D.
+      const free = modifiers.altKey
+      const step = !free && isGridSnapActive() ? getSegmentGridStep() : 0
       const snap = (value: number) => snapScalar(value, step)
-      const worldPoint = resolveCursor(planPoint, { snap })
+      const raw = resolveCursor(planPoint)
+      let worldPoint = resolveCursor(planPoint, { snap })
+      // Its wall line lands on the walls under it in grid and lines, its outer face on a porch's
+      // invisible walls or a deck's railings.
+      if (!free && (isGridSnapActive() || isMagneticSnapActive())) {
+        const caught = catchRoofOnWalls({
+          lines: [
+            {
+              center: raw,
+              angle: effRot,
+              hw: node.width / 2,
+              hd: node.depth / 2,
+              wallThickness: node.wallThickness,
+            },
+          ],
+          walls,
+          angle: effRot,
+        })
+        worldPoint = placeRoofOnWalls(raw, worldPoint, caught, effRot)
+      }
       const dx = worldPoint[0] - roofPosX
       const dz = worldPoint[1] - roofPosZ
       let localX = dx * cosRoof + dz * sinRoof
       let localZ = -dx * sinRoof + dz * cosRoof
       lastLocal = [localX, initialY, localZ]
-      useScene.getState().updateNode(segmentId, { position: lastLocal })
+      // Moved onto the walls under it, its gable and heel walls take their thickness.
+      lastThickness =
+        bearingWallThickness(
+          { center: worldPoint, angle: effRot, hw: node.width / 2, hd: node.depth / 2 },
+          walls,
+        ) ?? node.wallThickness
+      useLiveNodeOverrides.getState().set(segmentId, moved())
+      useScene.getState().markDirty(segmentId)
     },
     canCommit() {
       return true
     },
     commit() {
-      useScene.getState().updateNode(segmentId, { position: lastLocal })
+      useLiveNodeOverrides.getState().clear(segmentId)
+      // Dragged onto the walls that carry it, its roof goes to the level above them.
+      commitSeatedRoofEdit([{ id: segmentId, data: moved() }], segmentId)
     },
   }
 }

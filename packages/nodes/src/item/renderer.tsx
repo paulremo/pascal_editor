@@ -7,11 +7,13 @@ import {
   getScaledDimensions,
   type Interactive,
   type ItemNode,
+  isCutterName,
   isSlotMaterialName,
   itemClipRegistry,
   LIBRARY_MATERIAL_REF_PREFIX,
   type LightEffect,
   SCENE_MATERIAL_REF_PREFIX,
+  sceneRegistry,
   toLibraryMaterialRef,
   useInteractive,
   useLiveNodeOverrides,
@@ -20,27 +22,52 @@ import {
 } from '@pascal-app/core'
 import {
   type ColorPreset,
+  catalogLightSource,
+  configureKtx2Support,
   createDefaultMaterial,
   createSurfaceRoleMaterial,
   ErrorBoundary,
+  getViewerConfig,
   glassMaterial,
+  materialCastsShadow,
   NodeRenderer,
   type RenderShading,
   resolveCdnUrl,
   resolveMaterialRef,
+  ScriptedClips,
+  stampPascalTextureRef,
+  useClipActions,
   useItemLightPool,
   useNodeEvents,
   useViewer,
 } from '@pascal-app/viewer'
 import { useAnimations } from '@react-three/drei'
 import { Clone } from '@react-three/drei/core/Clone'
-import { useGLTF } from '@react-three/drei/core/Gltf'
-import { useFrame } from '@react-three/fiber'
-import { Suspense, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
-import type { AnimationAction, Group, Material, Mesh } from 'three'
-import { MathUtils } from 'three'
+import { useFrame, useLoader, useThree } from '@react-three/fiber'
+import {
+  type RefObject,
+  Suspense,
+  useCallback,
+  useEffect,
+  useLayoutEffect,
+  useMemo,
+  useRef,
+  useState,
+} from 'react'
+import type { AnimationAction, AnimationClip, Group, Material, Mesh, Object3D } from 'three'
+import { MathUtils, Texture } from 'three'
+import { DRACOLoader } from 'three/examples/jsm/loaders/DRACOLoader.js'
+import type { GLTF } from 'three/examples/jsm/loaders/GLTFLoader.js'
 import { positionLocal, smoothstep, time } from 'three/tsl'
+import { BlockFaceHostFrame } from '../shared/block-face-host'
+import { canRegisterItemLight } from '../shared/item-light-placement'
 import { RoofFaceHostFrame } from '../shared/roof-face-host'
+import {
+  cancelItemModelLoad,
+  getItemResourceFailures,
+  getUnavailableItemAsset,
+  ItemGLTFLoader,
+} from './model-loader'
 
 type MutableMaterial = Material & {
   depthTest?: boolean
@@ -125,7 +152,7 @@ const isCapturedMaterialArray = (
   captured: CapturedItemMaterialData,
 ): captured is CapturedMultiItemMaterialData => Array.isArray(captured.authoredMaterials)
 
-const isGlassMaterial = (material: Material): boolean =>
+const isLegacyGlassMaterial = (material: Material): boolean =>
   material === glassMaterial || material.name.toLowerCase() === 'glass'
 
 const clampGeometryGroups = (mesh: Mesh, matCount: number): void => {
@@ -164,7 +191,7 @@ const resolveItemMaterial = (
 ): Material => {
   // Monochrome (textures off): collapse to the themed furnishing clay colour.
   if (!textures) return createSurfaceRoleMaterial('furnishing', colorPreset)
-  if (authoredMaterial.name.toLowerCase() === 'glass') return glassMaterial
+  // Authored material names do not opt an asset into a Pascal preset.
   if (slotId != null) {
     const override = resolveMaterialRef(nodeSlots?.[slotId], sceneMaterials, shading)
     if (override) return override
@@ -178,11 +205,11 @@ const resolveItemMaterial = (
   return authoredMaterial
 }
 
-const BrokenItemFallback = ({ node }: { node: ItemNode }) => {
+const BrokenItemFallback = ({ node, events = true }: { node: ItemNode; events?: boolean }) => {
   const handlers = useNodeEvents(node, 'item')
   const shading = useViewer((s) => s.shading)
   const isExporting = useViewer((s) => s.isExporting)
-  const [w, h, d] = node.asset.dimensions
+  const [w, h, d] = getScaledDimensions(node)
   const material = useMemo(() => {
     const next = createDefaultMaterial('#ef4444', 1, shading) as MutableMaterial
     next.opacity = 0.6
@@ -197,75 +224,224 @@ const BrokenItemFallback = ({ node }: { node: ItemNode }) => {
   if (isExporting) return null
 
   return (
-    <mesh position-y={h / 2} {...handlers}>
+    <mesh position-y={h / 2} {...(events ? handlers : {})}>
       <boxGeometry args={[w, h, d]} />
       <primitive attach="material" object={material} />
     </mesh>
   )
 }
 
-const MODEL_RETRY_DELAYS_MS = [1_000, 3_000]
+let itemDracoLoader: DRACOLoader | null = null
+
+const configureItemModelLoader = (loader: ItemGLTFLoader, renderer: unknown) => {
+  configureKtx2Support(loader, renderer)
+  if (!itemDracoLoader) {
+    itemDracoLoader = new DRACOLoader(loader.manager)
+  }
+  itemDracoLoader.setDecoderPath(getViewerConfig().decoders.dracoPath)
+  loader.setDRACOLoader(itemDracoLoader)
+}
+
+type LoadedItemGltf = GLTF & {
+  materials: Record<string, Material>
+  nodes: Record<string, Object3D>
+}
+
+const ITEM_TEXTURE_SLOTS = [
+  'map',
+  'normalMap',
+  'roughnessMap',
+  'metalnessMap',
+  'emissiveMap',
+  'aoMap',
+  'alphaMap',
+  'lightMap',
+  'bumpMap',
+  'displacementMap',
+  'clearcoatMap',
+  'clearcoatNormalMap',
+  'clearcoatRoughnessMap',
+  'iridescenceMap',
+  'iridescenceThicknessMap',
+  'transmissionMap',
+  'thicknessMap',
+  'specularIntensityMap',
+  'specularColorMap',
+  'sheenRoughnessMap',
+  'sheenColorMap',
+  'anisotropyMap',
+] as const
+
+function getItemTextureImageIndex(gltf: LoadedItemGltf, texture: Texture): number | null {
+  const association = gltf.parser?.associations.get(texture)
+  const textureIndex = association?.textures
+  if (!Number.isInteger(textureIndex)) return null
+
+  const textureDef = gltf.parser.json.textures?.[textureIndex as number]
+  const imageIndex =
+    textureDef?.extensions?.KHR_texture_basisu?.source ??
+    textureDef?.extensions?.EXT_texture_webp?.source ??
+    textureDef?.extensions?.EXT_texture_avif?.source ??
+    textureDef?.source
+  return Number.isInteger(imageIndex) && imageIndex >= 0 ? imageIndex : null
+}
+
+function stampItemTextureReferences(gltf: LoadedItemGltf, src: string) {
+  if (!gltf.parser?.associations) return
+
+  const stamped = new Set<Texture>()
+  gltf.scene.traverse((object) => {
+    const mesh = object as Mesh
+    if (!mesh.isMesh) return
+    const materials = Array.isArray(mesh.material) ? mesh.material : [mesh.material]
+    for (const material of materials) {
+      const textureMaterial = material as Material & Record<string, unknown>
+      for (const slot of ITEM_TEXTURE_SLOTS) {
+        const texture = textureMaterial[slot]
+        if (!(texture instanceof Texture)) continue
+        if (stamped.has(texture)) continue
+        const imageIndex = getItemTextureImageIndex(gltf, texture)
+        if (imageIndex === null) continue
+        if (
+          stampPascalTextureRef(texture, {
+            kind: 'item-glb',
+            src,
+            slot,
+            imageIndex,
+          })
+        ) {
+          stamped.add(texture)
+        }
+      }
+    }
+  })
+}
+
+const useItemGltf = (url: string): LoadedItemGltf => {
+  const renderer = useThree((state) => state.gl)
+  const gltf = useLoader(ItemGLTFLoader, url, (loader) =>
+    configureItemModelLoader(loader, renderer),
+  ) as LoadedItemGltf
+  return useMemo(() => {
+    stampItemTextureReferences(gltf, url)
+    return gltf
+  }, [gltf, url])
+}
+
+type DeferredUnavailableCleanup = {
+  consumers: number
+  timer: ReturnType<typeof setTimeout> | null
+}
+
+const unavailableAssetConsumers = new Map<string, DeferredUnavailableCleanup>()
+const unavailableFailureConsumers = new Map<string, DeferredUnavailableCleanup>()
+
+const retainUnavailableConsumer = (
+  entries: Map<string, DeferredUnavailableCleanup>,
+  key: string,
+) => {
+  const entry = entries.get(key) ?? { consumers: 0, timer: null }
+  if (entry.timer !== null) {
+    clearTimeout(entry.timer)
+    entry.timer = null
+  }
+  entry.consumers += 1
+  entries.set(key, entry)
+}
+
+const releaseUnavailableConsumer = (
+  entries: Map<string, DeferredUnavailableCleanup>,
+  key: string,
+  onLastRelease: () => void,
+) => {
+  const entry = entries.get(key)
+  if (!entry) return
+  entry.consumers = Math.max(0, entry.consumers - 1)
+  if (entry.consumers > 0 || entry.timer !== null) return
+
+  // A zero-delay release distinguishes a real unmount from Strict Mode's
+  // immediate setup-cleanup-setup cycle and same-tick replacements.
+  entry.timer = setTimeout(() => {
+    if (entry.consumers > 0 || entries.get(key) !== entry) return
+    entries.delete(key)
+    onLastRelease()
+  }, 0)
+}
+
+const UnavailableItemModel = ({
+  markSettled,
+  node,
+  url,
+  events,
+}: {
+  markSettled: () => void
+  node: ItemNode
+  url: string
+  events: boolean
+}) => {
+  useEffect(() => {
+    retainUnavailableConsumer(unavailableFailureConsumers, node.id)
+    if (url) retainUnavailableConsumer(unavailableAssetConsumers, url)
+    markSettled()
+    useViewer.getState().reportItemLoadFailure(node.id, url)
+    return () => {
+      releaseUnavailableConsumer(unavailableFailureConsumers, node.id, () =>
+        useViewer.getState().clearItemLoadFailure(node.id),
+      )
+      if (url) {
+        releaseUnavailableConsumer(unavailableAssetConsumers, url, () => {
+          cancelItemModelLoad(url)
+          useLoader.clear(ItemGLTFLoader, url)
+        })
+      }
+    }
+  }, [markSettled, node.id, url])
+
+  return <BrokenItemFallback events={events} node={node} />
+}
 
 /**
- * Load the item model with bounded retries. drei's `useGLTF` caches a rejected
- * load by URL, so a transient fetch failure (e.g. a storage 504 under the bake
- * page's asset-request burst) would otherwise stay broken for the whole
- * session — clear the cache entry and re-mount. After the retries are
- * exhausted the item settles as SKIPPED: it renders the debug box (nothing
- * during exports) and lands in `useViewer.itemLoadFailures` so a bake host can
- * record which items are missing from the artifact.
+ * Expected network and malformed nonbinary JSON failures resolve through
+ * ItemGLTFLoader as an unavailable scene so they never become React render
+ * errors. Other parser and renderer failures still reach this boundary.
  */
 const ModelWithRetry = ({
   node,
   setSettled,
+  events = true,
 }: {
   node: ItemNode
   setSettled: (value: boolean) => void
+  /** False when a host node (a scripted window or door) owns the pointer events. */
+  events?: boolean
 }) => {
-  // `failures` counts boundary catches; `epoch` bumps after each cache clear
-  // to reset the boundary and re-mount the loader. The retry timer is owned by
-  // an effect (not the error handler) so StrictMode's synthetic
-  // unmount/remount re-arms it instead of silently discarding it. The host
-  // keys this component by asset URL, so a model swap starts from a clean
-  // retry budget — and the mount effect below un-settles the item so the new
-  // load is awaited too.
-  const [failures, setFailures] = useState(0)
-  const [epoch, setEpoch] = useState(0)
+  const [renderFailed, setRenderFailed] = useState(false)
   const url = resolveCdnUrl(node.asset.src) || ''
-  const gaveUp = !url || failures > MODEL_RETRY_DELAYS_MS.length
+  const markSettled = useCallback(() => setSettled(true), [setSettled])
 
-  const handleError = useCallback(() => setFailures((current) => current + 1), [])
-
-  useEffect(() => {
+  // Clear before child passive completion effects; a parent passive clear would run after them.
+  useLayoutEffect(() => {
     setSettled(false)
   }, [setSettled])
 
   useEffect(() => {
-    if (failures === 0 || gaveUp) return
-    const delay = MODEL_RETRY_DELAYS_MS[failures - 1] ?? 0
-    const timer = setTimeout(() => {
-      console.log(`[item] retrying model load (${failures}/${MODEL_RETRY_DELAYS_MS.length}) ${url}`)
-      useGLTF.clear(url)
-      setEpoch((current) => current + 1)
-    }, delay)
-    return () => clearTimeout(timer)
-  }, [failures, gaveUp, url])
-
-  const markSettled = useCallback(() => setSettled(true), [setSettled])
-
-  useEffect(() => {
-    if (!gaveUp) return
+    if (!renderFailed) return
     markSettled()
     useViewer.getState().reportItemLoadFailure(node.id, url)
     return () => useViewer.getState().clearItemLoadFailure(node.id)
-  }, [gaveUp, markSettled, node.id, url])
+  }, [markSettled, node.id, renderFailed, url])
 
-  if (gaveUp) return <BrokenItemFallback node={node} />
+  if (!url)
+    return <UnavailableItemModel events={events} markSettled={markSettled} node={node} url={url} />
 
   return (
-    <ErrorBoundary fallback={<PreviewModel node={node} />} onError={handleError} resetKey={epoch}>
+    <ErrorBoundary
+      fallback={<BrokenItemFallback events={events} node={node} />}
+      onError={() => setRenderFailed(true)}
+      scope="item-model"
+    >
       <Suspense fallback={<PreviewModel node={node} />}>
-        <ModelRenderer markSettled={markSettled} node={node} />
+        <ModelRenderer events={events} markSettled={markSettled} node={node} />
       </Suspense>
     </ErrorBoundary>
   )
@@ -311,13 +487,27 @@ export const ItemRenderer = ({ node: storeNode }: { node: ItemNode }) => {
         <>
           <ModelWithRetry key={node.asset.src ?? 'no-src'} node={node} setSettled={setSettled} />
           {node.children?.map((childId) => (
-            <NodeRenderer key={childId} nodeId={childId} />
+            <NodeRenderer key={childId} nodeId={childId as AnyNodeId} />
           ))}
         </>
       )}
     </group>
   )
 
+  // A floor-exit override is still mounted beneath the stored block until commit.
+  const faceNode =
+    liveOverrides?.parentId &&
+    useScene.getState().nodes[liveOverrides.parentId as AnyNodeId]?.type === 'level' &&
+    useScene.getState().nodes[storeNode.parentId as AnyNodeId]?.type === 'block'
+      ? storeNode
+      : node
+  if (faceNode.blockFaceId && faceNode.parentId) {
+    return (
+      <BlockFaceHostFrame blockId={faceNode.parentId} faceId={faceNode.blockFaceId}>
+        {content}
+      </BlockFaceHostFrame>
+    )
+  }
   if (!node.roofSegmentId) return content
   return (
     <RoofFaceHostFrame roofFace={node.roofFace} roofSegmentId={node.roofSegmentId}>
@@ -345,14 +535,41 @@ function getPreviewMaterial(shading: RenderShading): Material {
 const PreviewModel = ({ node }: { node: ItemNode }) => {
   const shading = useViewer((s) => s.shading)
   const isExporting = useViewer((s) => s.isExporting)
+  const [w, h, d] = getScaledDimensions(node)
   // Loading placeholder — must never land in an exported GLB.
   if (isExporting) return null
   return (
-    <mesh material={getPreviewMaterial(shading)} position-y={node.asset.dimensions[1] / 2}>
-      <boxGeometry
-        args={[node.asset.dimensions[0], node.asset.dimensions[1], node.asset.dimensions[2]]}
-      />
+    <mesh material={getPreviewMaterial(shading)} position-y={h / 2}>
+      <boxGeometry args={[w, h, d]} />
     </mesh>
+  )
+}
+
+const LoadedItemPreview = ({ node }: { node: ItemNode }) => {
+  const gltf = useItemGltf(resolveCdnUrl(node.asset.src) || '')
+  if (getUnavailableItemAsset(gltf)) return <PreviewModel node={node} />
+  return (
+    <group rotation={node.rotation} scale={node.scale}>
+      <Clone
+        dispose={null}
+        object={gltf.scene}
+        position={node.asset.offset}
+        rotation={node.asset.rotation}
+        scale={node.asset.scale || [1, 1, 1]}
+      />
+    </group>
+  )
+}
+
+export const ItemPreview = ({ node }: { node: ItemNode }) => {
+  const url = resolveCdnUrl(node.asset.src) || ''
+  if (!url) return <PreviewModel node={node} />
+  return (
+    <Suspense fallback={<PreviewModel node={node} />}>
+      <ErrorBoundary fallback={<PreviewModel node={node} />} scope="item-preview-model">
+        <LoadedItemPreview node={node} />
+      </ErrorBoundary>
+    </Suspense>
   )
 }
 
@@ -376,21 +593,57 @@ const ClearPreviewModel = ({ node }: { node: ItemNode }) => {
   )
 }
 
-const multiplyScales = (
-  a: [number, number, number],
-  b: [number, number, number],
-): [number, number, number] => [a[0] * b[0], a[1] * b[1], a[2] * b[2]]
+const ModelRenderer = ({
+  node,
+  markSettled,
+  events,
+}: {
+  node: ItemNode
+  markSettled: () => void
+  events: boolean
+}) => {
+  const gltf = useItemGltf(resolveCdnUrl(node.asset.src) || '')
+  const unavailable = getUnavailableItemAsset(gltf)
+  if (unavailable) {
+    return (
+      <UnavailableItemModel
+        events={events}
+        markSettled={markSettled}
+        node={node}
+        url={unavailable.url}
+      />
+    )
+  }
+  return <LoadedModelRenderer events={events} gltf={gltf} markSettled={markSettled} node={node} />
+}
 
-const ModelRenderer = ({ node, markSettled }: { node: ItemNode; markSettled?: () => void }) => {
-  const { scene, nodes, animations } = useGLTF(resolveCdnUrl(node.asset.src) || '')
+const LoadedModelRenderer = ({
+  gltf: { scene, nodes, animations, userData },
+  node,
+  markSettled,
+  events,
+}: {
+  gltf: LoadedItemGltf
+  node: ItemNode
+  markSettled: () => void
+  events: boolean
+}) => {
   const ref = useRef<Group>(null!)
-  const { actions } = useAnimations(animations, ref)
 
   // Mounting past the suspense gate means the GLB resolved — the item's build
   // work is done (`ItemSystem` may clear its dirty mark, scene-ready may fire).
   useEffect(() => {
-    markSettled?.()
-  }, [markSettled])
+    // Clip presence, not just the effect path: with no animEffect,
+    // <ItemAnimation> still autoplays the first clip, and the node batch must
+    // keep such items out of static batches (shared/node-batch/candidates).
+    const group = sceneRegistry.nodes.get(node.id)
+    if (group) group.userData.itemHasAnimations = animations.length > 0
+    const failedResources = getItemResourceFailures({ userData })
+    if (failedResources.length)
+      useViewer.getState().reportItemLoadFailure(node.id, failedResources[0]!)
+    markSettled()
+    if (failedResources.length) return () => useViewer.getState().clearItemLoadFailure(node.id)
+  }, [markSettled, node.id, animations, userData])
   const shading = useViewer((s) => s.shading)
   const textures = useViewer((s) => s.textures)
   const colorPreset = useViewer((s) => s.colorPreset)
@@ -426,12 +679,13 @@ const ModelRenderer = ({ node, markSettled }: { node: ItemNode; markSettled?: ()
       if (!(child as Mesh).isMesh) return
 
       const mesh = child as Mesh
-      if (mesh.name === 'cutout') {
-        child.visible = false
-      }
+      // `cutout` drives wall openings, `collider` the walkthrough; neither renders.
+      const name = typeof mesh.userData.name === 'string' ? mesh.userData.name : mesh.name
+      const helper = isCutterName(name) || name === 'collider'
+      if (helper) child.visible = false
 
       const captured = captureItemMeshMaterials(mesh)
-      if (mesh.name !== 'cutout') meshEntries.push({ mesh, captured })
+      if (!helper) meshEntries.push({ mesh, captured })
     })
 
     const materialOptions = {
@@ -443,7 +697,7 @@ const ModelRenderer = ({ node, markSettled }: { node: ItemNode; markSettled?: ()
     }
 
     for (const { mesh, captured } of meshEntries) {
-      let hasGlass = false
+      let hasLegacyGlass = false
 
       if (isCapturedMaterialArray(captured)) {
         const nextMaterials = captured.authoredMaterials.map((authoredMaterial, index) =>
@@ -455,7 +709,7 @@ const ModelRenderer = ({ node, markSettled }: { node: ItemNode; markSettled?: ()
           ),
         )
         mesh.material = nextMaterials
-        hasGlass = nextMaterials.some(isGlassMaterial)
+        hasLegacyGlass = nextMaterials.some(isLegacyGlassMaterial)
         clampGeometryGroups(mesh, nextMaterials.length)
       } else {
         const nextMaterial = resolveItemMaterial(
@@ -465,11 +719,11 @@ const ModelRenderer = ({ node, markSettled }: { node: ItemNode; markSettled?: ()
           materialOptions,
         )
         mesh.material = nextMaterial
-        hasGlass = isGlassMaterial(nextMaterial)
+        hasLegacyGlass = isLegacyGlassMaterial(nextMaterial)
       }
 
-      mesh.castShadow = !hasGlass
-      mesh.receiveShadow = !hasGlass
+      mesh.castShadow = materialCastsShadow(mesh.material)
+      mesh.receiveShadow = !hasLegacyGlass
     }
   }, [shading, textures, colorPreset, node.slots, sceneMaterials])
 
@@ -479,40 +733,60 @@ const ModelRenderer = ({ node, markSettled }: { node: ItemNode; markSettled?: ()
   const lightEffects =
     interactive?.effects.filter((e): e is LightEffect => e.kind === 'light') ?? []
 
-  // Expose this item's ambient clip (e.g. a fan's spin) to the GLB bake. The
-  // catalog GLB owns the clip; it isn't in the scene graph, so the export can't
-  // find it without this registry. The bake retargets it onto the baked subtree.
+  // Expose this item's clips to the GLB bake: the GLB owns them and they are
+  // not in the scene graph, so the export can't find them without this
+  // registry. A catalog item bakes its ambient clip (a fan's spin); an
+  // authored object bakes every clip, its opening played once.
+  const scripted = Boolean(node.source)
   useEffect(() => {
-    if (!animEffect) return
-    const clipName = animEffect.clips.on ?? animEffect.clips.loop
-    const clip = clipName ? animations.find((c) => c.name === clipName) : undefined
-    if (!clip) return
-    itemClipRegistry.set(node.id, { clip, loop: true })
+    const entries = scripted
+      ? animations.map((clip) => ({
+          clip,
+          loop: clip.name !== 'open' && clip.name !== 'close',
+          name: clip.name,
+        }))
+      : (() => {
+          const clipName = animEffect ? (animEffect.clips.on ?? animEffect.clips.loop) : undefined
+          const clip = clipName ? animations.find((c) => c.name === clipName) : undefined
+          return clip ? [{ clip, loop: true, name: 'loop' }] : []
+        })()
+    if (entries.length === 0) return
+    itemClipRegistry.set(node.id, entries)
     return () => {
       itemClipRegistry.delete(node.id)
     }
-  }, [node.id, animEffect, animations])
+  }, [node.id, animEffect, animations, scripted])
 
   // useGLTF caches scenes, and Clone shares child geometry/material references.
   // Undo can unmount one item while another clone of the same asset still needs them.
   return (
     <>
-      <Clone
-        dispose={null}
-        object={scene}
-        position={node.asset.offset}
-        ref={ref}
-        rotation={node.asset.rotation}
-        scale={multiplyScales(node.asset.scale || [1, 1, 1], node.scale || [1, 1, 1])}
-        {...handlers}
-      />
-      {animations.length > 0 && (
+      <group scale={node.scale}>
+        <Clone
+          dispose={null}
+          object={scene}
+          position={node.asset.offset}
+          ref={ref}
+          rotation={node.asset.rotation}
+          scale={node.asset.scale || [1, 1, 1]}
+          {...(events ? handlers : {})}
+        />
+      </group>
+      {animations.length > 0 && scripted && interactive && (
+        <ScriptedAnimations
+          animations={animations}
+          interactive={interactive}
+          nodeId={node.id}
+          rootRef={ref}
+        />
+      )}
+      {animations.length > 0 && !scripted && (
         <ItemAnimation
-          actions={actions}
           animations={animations}
           animEffect={animEffect}
           interactive={interactive ?? null}
           nodeId={node.id}
+          rootRef={ref}
         />
       )}
       {lightEffects.map((effect, i) => (
@@ -522,6 +796,8 @@ const ModelRenderer = ({ node, markSettled }: { node: ItemNode; markSettled?: ()
           interactive={interactive!}
           key={i}
           nodeId={node.id}
+          canRegister={canRegisterItemLight(node.metadata)}
+          localScale={scripted ? node.scale : undefined}
         />
       ))}
     </>
@@ -532,15 +808,16 @@ const ItemAnimation = ({
   nodeId,
   animEffect,
   interactive,
-  actions,
   animations,
+  rootRef,
 }: {
   nodeId: AnyNodeId
   animEffect: AnimationEffect | null
   interactive: Interactive | null
-  actions: Record<string, AnimationAction | null>
-  animations: { name: string }[]
+  animations: AnimationClip[]
+  rootRef: RefObject<Group>
 }) => {
+  const { actions } = useAnimations(animations, rootRef)
   const activeClipRef = useRef<string | null>(null)
   const fadingOutRef = useRef<AnimationAction | null>(null)
 
@@ -600,24 +877,61 @@ const ItemAnimation = ({
   return null
 }
 
+/** An authored object's clips, played through the shared `ScriptedClips`. */
+const ScriptedAnimations = ({
+  nodeId,
+  interactive,
+  animations,
+  rootRef,
+}: {
+  nodeId: AnyNodeId
+  interactive: Interactive
+  animations: AnimationClip[]
+  rootRef: RefObject<Group>
+}) => {
+  const actions = useClipActions(animations, rootRef)
+  return <ScriptedClips actions={actions} interactive={interactive} nodeId={nodeId} />
+}
+
 const ItemLightRegistrar = ({
   nodeId,
   effect,
   interactive,
   index,
+  canRegister,
+  localScale,
 }: {
   nodeId: AnyNodeId
   effect: LightEffect
   interactive: Interactive
   index: number
+  canRegister: boolean
+  localScale?: [number, number, number]
 }) => {
   useEffect(() => {
+    if (!canRegister) return
     const key = `${nodeId}:${index}`
-    useItemLightPool.getState().register(key, nodeId, effect, interactive)
+    useItemLightPool
+      .getState()
+      .register(catalogLightSource(key, nodeId, effect, interactive, localScale))
     return () => useItemLightPool.getState().unregister(key)
-  }, [nodeId, index, effect, interactive])
+  }, [nodeId, index, effect, interactive, canRegister, localScale])
 
   return null
 }
+
+/**
+ * An artifact rendered through the item's model path (GLB, paint slots,
+ * clips, lights, load settling) for a node that is not an item: a window or
+ * door built from a script. `view` is that node seen as an item; the host
+ * node keeps its own registry entry and pointer events.
+ */
+export const ScriptedModel = ({
+  view,
+  setSettled,
+}: {
+  view: ItemNode
+  setSettled: (value: boolean) => void
+}) => <ModelWithRetry events={false} key={view.asset.src} node={view} setSettled={setSettled} />
 
 export default ItemRenderer

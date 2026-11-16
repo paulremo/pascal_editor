@@ -1,9 +1,15 @@
 import {
+  getBarrelRoofFaces,
+  getConicalRoofCoverage,
+  getGlazedRoofFaces,
   getRoofModuleFaces,
+  getRoofSegmentDeckReach,
   getRoofSegmentSurfaceY,
   getRoofShapeInsets,
   getRoofShapeRatios,
   getSegmentSlopeFrame,
+  glazedRoofFacePoint,
+  isGlazedRoofSegment,
   ROOF_SHAPE_DEFAULTS,
   type RoofSegmentNode,
 } from '@pascal-app/core'
@@ -90,16 +96,23 @@ function getRoofSurfaceFaces(segment: RoofSegmentNode): RoofSurfaceFace[] {
 }
 
 function roofSurfaceFaceCacheKey(segment: RoofSegmentNode): string {
+  const conicalCoverage = getConicalRoofCoverage(segment)
   return [
     segment.roofType,
+    segment.roofSystem,
     segment.width,
     segment.depth,
     segment.wallHeight,
     segment.wallThickness,
     segment.deckThickness,
     segment.overhang,
+    segment.gableOverhang,
     segment.shingleThickness,
     segment.pitch,
+    segment.barrelRise,
+    segment.barrelSegments,
+    conicalCoverage.startAngle,
+    conicalCoverage.sweepAngle,
     segment.gambrelLowerWidthRatio ?? ROOF_SHAPE_DEFAULTS.gambrelLowerWidthRatio,
     segment.gambrelLowerHeightRatio ?? ROOF_SHAPE_DEFAULTS.gambrelLowerHeightRatio,
     segment.mansardSteepWidthRatio ?? ROOF_SHAPE_DEFAULTS.mansardSteepWidthRatio,
@@ -107,21 +120,36 @@ function roofSurfaceFaceCacheKey(segment: RoofSegmentNode): string {
     segment.dutchHipWidthRatio ?? ROOF_SHAPE_DEFAULTS.dutchHipWidthRatio,
     segment.dutchHipHeightRatio ?? ROOF_SHAPE_DEFAULTS.dutchHipHeightRatio,
     segment.dutchWaistLengthRatio ?? ROOF_SHAPE_DEFAULTS.dutchWaistLengthRatio,
+    segment.dutchGabletRake ?? ROOF_SHAPE_DEFAULTS.dutchGabletRake,
+    segment.dutchTopRakeThickness ?? ROOF_SHAPE_DEFAULTS.dutchTopRakeThickness,
   ].join('|')
 }
 
 function buildRoofSurfaceFaces(segment: RoofSegmentNode): RoofSurfaceFace[] {
-  const { roofType, width, depth, wallHeight, wallThickness, deckThickness, overhang } = segment
+  if (isGlazedRoofSegment(segment) || segment.roofType === 'barrel')
+    return (
+      isGlazedRoofSegment(segment) ? getGlazedRoofFaces(segment) : getBarrelRoofFaces(segment)
+    )
+      .filter((face) => face.normal[1] > 0)
+      .map((face) => {
+        const vertices = face.polygon.map(([u, v]) => {
+          const [x, y, z] = glazedRoofFacePoint(face, u, v)
+          return { x, y, z }
+        })
+        return { vertices, polygon: vertices.map(({ x, z }): RoofSurfacePoint2D => [x, z]) }
+      })
+  const conicalCoverage = getConicalRoofCoverage(segment)
+  const { roofType, width, depth, wallHeight, deckThickness } = segment
   const { activeRh, tanTheta, cosTheta, sinTheta } = getSegmentSlopeFrame(segment)
 
   const verticalRt = activeRh > 0 ? deckThickness / cosTheta : deckThickness
-  const horizontalOverhang = (overhang ?? 0) * cosTheta
-  const deckExt = wallThickness / 2 + horizontalOverhang
+  const reach = getRoofSegmentDeckReach(segment)
+  const deckExt = reach.z
   const shingleThickness = segment.shingleThickness ?? 0
   const stSin = shingleThickness * sinTheta
   const stCos = shingleThickness * cosTheta
 
-  const shinBotW = Math.max(0.01, width + 2 * deckExt)
+  const shinBotW = Math.max(0.01, width + 2 * reach.x)
   const shinBotD = Math.max(0.01, depth + 2 * deckExt)
   const deckDrop = deckExt * tanTheta
   const shinBotWh = wallHeight - deckDrop + verticalRt
@@ -136,7 +164,12 @@ function buildRoofSurfaceFaces(segment: RoofSegmentNode): RoofSurfaceFace[] {
   let shinTopD = shinBotD
   let transZ = 0
 
-  if (roofType === 'hip' || roofType === 'mansard' || roofType === 'dutch') {
+  if (
+    roofType === 'hip' ||
+    roofType === 'mansard' ||
+    roofType === 'dutch' ||
+    roofType === 'conical'
+  ) {
     shinTopW += 2 * stSin
     shinTopD += 2 * stSin
   } else if (roofType === 'gable' || roofType === 'gambrel') {
@@ -191,6 +224,8 @@ function buildRoofSurfaceFaces(segment: RoofSegmentNode): RoofSurfaceFace[] {
     tanTheta,
     shapeRatios,
     dutchTopRakeThickness: segment.dutchTopRakeThickness,
+    conicalStartAngle: conicalCoverage.startAngle,
+    conicalSweepAngle: conicalCoverage.sweepAngle,
   })
     .filter((face) => faceNormalY(face) > SHINGLE_SURFACE_EPSILON)
     .map((face) => {
@@ -403,6 +438,15 @@ export function getAnalyticalNormal(
   if (slope.activeRh === 0 || slope.tanTheta === 0) {
     return out.set(0, 1, 0)
   }
+  if (roofType === 'barrel') {
+    const face = getBarrelRoofFaces(seg).find(
+      (face) =>
+        face.normal[1] > 0 &&
+        (lz - face.origin[2]) / face.v[2] >= -1e-6 &&
+        (lz - face.origin[2]) / face.v[2] <= face.length + 1e-6,
+    )
+    return face ? out.set(...face.normal) : out.set(0, 1, 0)
+  }
   const primaryTan = slope.tanTheta
   const halfW = width / 2
   const halfD = depth / 2
@@ -432,6 +476,12 @@ export function getAnalyticalNormal(
   // Single slope falling toward +Z (ridge at -Z, eave at +Z).
   if (roofType === 'shed') {
     return buildSlopeNormal(0, 1, primaryTan, out)
+  }
+
+  if (roofType === 'conical') {
+    const radius = Math.hypot(lx, lz)
+    if (radius <= 1e-6) return out.set(0, 1, 0)
+    return buildSlopeNormal(lx / radius, lz / radius, primaryTan, out)
   }
 
   // 4-sided slopes: the dominant axis chooses which face the point sits

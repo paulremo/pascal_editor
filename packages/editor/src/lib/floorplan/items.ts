@@ -2,11 +2,14 @@ import {
   type AnyNode,
   type AnyNodeId,
   getScaledDimensions,
+  getWallBodyCenterOffset,
+  getWallLocalFaceZ,
   type ItemNode,
   type LevelNode,
+  rotatePlanVector,
   useLiveTransforms,
 } from '@pascal-app/core'
-import { getRotatedRectanglePolygon, rotatePlanVector } from './geometry'
+import { getRotatedRectanglePolygon } from './geometry'
 import type { FloorplanItemEntry, FloorplanNodeTransform, LevelDescendantMap } from './types'
 
 export function collectLevelDescendants(
@@ -82,8 +85,9 @@ export function getItemFloorplanTransform(
       )
       const wallLocalZ =
         item.asset.attachTo === 'wall-side'
-          ? ((parentNode.thickness ?? 0.1) / 2) * (item.side === 'front' ? 1 : -1)
-          : item.position[2]
+          ? getWallLocalFaceZ(parentNode, item.side === 'front' ? 'a' : 'b')
+          : item.position[2] +
+            (item.asset.attachTo === 'wall' ? getWallBodyCenterOffset(parentNode) : 0)
       const [offsetX, offsetY] = rotatePlanVector(item.position[0], wallLocalZ, wallRotation)
 
       result = {

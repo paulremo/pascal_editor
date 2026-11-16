@@ -5,7 +5,7 @@
     "build": {
       "dependsOn": ["^build"],
       "inputs": ["$TURBO_DEFAULT$", ".env*"],
-      "outputs": [".next/**", "!.next/cache/**", "dist/**"],
+      "outputs": [".next/**", "!.next/cache/**", "dist/**", "tsconfig.tsbuildinfo"],
       "env": [
         "SKIP_ENV_VALIDATION",
         "BETTER_AUTH_SECRET",
@@ -16,7 +16,8 @@
         "POSTGRES_URL",
         "NEXT_PUBLIC_SUPABASE_URL",
         "NEXT_PUBLIC_SUPABASE_ANON_KEY",
-        "SUPABASE_SERVICE_ROLE_KEY"
+        "SUPABASE_SERVICE_ROLE_KEY",
+        "PASCAL_PORTABLE_BUILD"
       ]
     },
     "lint": {
@@ -24,6 +25,26 @@
     },
     "check-types": {
       "dependsOn": ["^build", "^check-types"]
+    },
+    "test": {
+      "dependsOn": ["^build"],
+      "outputs": []
+    },
+    "@pascal-app/core#test": {
+      "dependsOn": ["build"],
+      "outputs": []
+    },
+    "@pascal-app/viewer#test": {
+      "dependsOn": ["build"],
+      "outputs": []
+    },
+    "@pascal-app/mcp#test": {
+      "dependsOn": ["build"],
+      "outputs": []
+    },
+    "@pascal-app/nodes#test": {
+      "dependsOn": ["build"],
+      "outputs": []
     },
     "dev": {
       "dependsOn": ["^build"],

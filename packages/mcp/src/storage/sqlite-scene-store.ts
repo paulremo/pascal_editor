@@ -9,6 +9,7 @@ import { openSqliteDatabase, type SqliteDatabase } from './sqlite-driver'
 import {
   type ProjectCreateOptions,
   type ProjectStatus,
+  type SceneDeleteResult,
   type SceneEvent,
   type SceneEventAppendOptions,
   type SceneEventListOptions,
@@ -70,10 +71,18 @@ interface ProjectPlaceholder {
   updatedAt: string
 }
 
+// `z.object()` strips keys it doesn't name, so every field that must survive a
+// save→load round trip has to be listed here. Values stay `unknown` rather than
+// being validated against `SceneMaterial`/`Collection`: nothing validates on the
+// way in, and `parseGraph` throws, so a strict shape here would let one odd
+// stored value make a saved scene permanently unloadable. Validation belongs on
+// the write path, where the caller can still react to it.
 const GraphSchema = z.object({
   nodes: z.record(z.string(), z.unknown()),
   rootNodeIds: z.array(z.string()),
   collections: z.record(z.string(), z.unknown()).optional(),
+  materials: z.record(z.string(), z.unknown()).optional(),
+  installedPlugins: z.array(z.string()).optional(),
 })
 
 /**
@@ -148,7 +157,8 @@ function rowToMeta(row: SceneRow): SceneMeta {
 }
 
 function editorUrlForScene(id: string): string {
-  return `/editor/${id}`
+  const origin = process.env.PASCAL_EDITOR_ORIGIN?.replace(/\/$/, '')
+  return origin ? `${origin}/scene/${encodeURIComponent(id)}` : `/editor/${id}`
 }
 
 function hashGraphJson(graphJson: string): string {
@@ -284,7 +294,9 @@ export class SqliteSceneStore implements SceneStore {
 
   constructor(opts: SqliteSceneStoreOptions = {}) {
     const env = opts.env ?? process.env
-    this.databasePath = path.resolve(opts.databasePath ?? resolveDefaultDatabasePath(env))
+    this.databasePath = path.resolve(
+      /* turbopackIgnore: true */ opts.databasePath ?? resolveDefaultDatabasePath(env),
+    )
     this.maxSceneBytes = resolveMaxSceneBytes(env, opts.maxSceneBytes)
   }
 
@@ -484,18 +496,18 @@ export class SqliteSceneStore implements SceneStore {
     return rows.map((row) => rowToMeta(row as SceneRow))
   }
 
-  async delete(id: string, opts: SceneMutateOptions = {}): Promise<boolean> {
+  async delete(id: string, opts: SceneMutateOptions = {}): Promise<SceneDeleteResult> {
     return this.withWriteTransaction((db) => {
       const safeId = sanitizeSlug(id)
       const existing = this.getRow(db, safeId)
-      if (!existing) return false
+      if (!existing) return { deleted: false, hidden: false }
       if (opts.expectedVersion !== undefined && existing.version !== opts.expectedVersion) {
         throw new SceneVersionConflictError(
           `Scene "${safeId}" version mismatch: expected ${opts.expectedVersion}, got ${existing.version}`,
         )
       }
       db.query('DELETE FROM scenes WHERE id = ?').run(safeId)
-      return true
+      return { deleted: true, hidden: false }
     })
   }
 

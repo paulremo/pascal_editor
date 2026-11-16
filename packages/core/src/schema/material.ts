@@ -35,6 +35,12 @@ export const MaterialSchema = z.object({
       url: AssetUrl,
       repeat: z.tuple([z.number(), z.number()]).optional(),
       scale: z.number().optional(),
+      /** Shift of the pattern, in texture repeats, applied to every map below. */
+      offset: z.tuple([z.number(), z.number()]).optional(),
+      normalMap: AssetUrl.optional(),
+      normalScale: z.number().optional(),
+      bumpMap: AssetUrl.optional(),
+      bumpScale: z.number().optional(),
     })
     .optional(),
 })
@@ -63,6 +69,7 @@ export const MaterialTarget = z.enum([
   'cupola',
   'eyebrow-vent',
   'gutter',
+  'downspout',
 ])
 export type MaterialTarget = z.infer<typeof MaterialTarget>
 
@@ -115,7 +122,7 @@ export type MaterialPresetPayload = z.infer<typeof MaterialPresetPayloadSchema>
 
 export const DEFAULT_MATERIALS: Record<MaterialPreset, MaterialProperties> = {
   white: {
-    color: '#ffffff',
+    color: '#e9e9e9',
     roughness: 0.9,
     metalness: 0,
     opacity: 1,
@@ -163,7 +170,7 @@ export const DEFAULT_MATERIALS: Record<MaterialPreset, MaterialProperties> = {
     side: 'front',
   },
   plaster: {
-    color: '#f5f5dc',
+    color: '#ebebd3',
     roughness: 0.95,
     metalness: 0,
     opacity: 1,
@@ -179,7 +186,7 @@ export const DEFAULT_MATERIALS: Record<MaterialPreset, MaterialProperties> = {
     side: 'front',
   },
   marble: {
-    color: '#fafafa',
+    color: '#ebebeb',
     roughness: 0.2,
     metalness: 0.1,
     opacity: 1,
@@ -187,7 +194,7 @@ export const DEFAULT_MATERIALS: Record<MaterialPreset, MaterialProperties> = {
     side: 'front',
   },
   custom: {
-    color: '#ffffff',
+    color: '#e9e9e9',
     roughness: 0.5,
     metalness: 0,
     opacity: 1,

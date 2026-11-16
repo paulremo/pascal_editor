@@ -2,10 +2,15 @@ import {
   type AnyNode,
   type AnyNodeId,
   collectLevelWallSegments,
+  getDoorOpeningSize,
   getScaledDimensions,
+  getWallArcData,
+  getWallCurveFrameAt,
+  getWallCurveLength,
   type ItemNode,
+  isCurvedWall,
   nearestWallSegment,
-  useScene,
+  openingHostFacing,
   WALL_SNAP_DISTANCE_M,
   type WallNode,
 } from '@pascal-app/core'
@@ -109,6 +114,142 @@ export function findClosestWallInPlan(
   }
 }
 
+type CurvedWallPlanHit = {
+  distance: number
+  localX: number
+  perpDistance: number
+  dirX: number
+  dirY: number
+  wallLength: number
+}
+
+export type WallPlanAttachment = Omit<WallHit, 'wall'> & {
+  distance: number
+}
+
+function closestCurvedWallInPlan(
+  wall: WallNode,
+  planPoint: readonly [number, number],
+  maxDistance: number,
+): CurvedWallPlanHit | null {
+  const arc = getWallArcData(wall)
+  const wallLength = getWallCurveLength(wall)
+  if (!arc || wallLength <= 1e-6) return null
+
+  const pointAngle = Math.atan2(planPoint[1] - arc.center.y, planPoint[0] - arc.center.x)
+  let directedAngle = (pointAngle - arc.startAngle) * arc.direction
+  while (directedAngle < 0) directedAngle += Math.PI * 2
+
+  const candidates = [0, 1]
+  const arcAngle = Math.abs(arc.delta)
+  if (directedAngle <= arcAngle) candidates.push(directedAngle / arcAngle)
+
+  let best: { distance: number; t: number } | null = null
+  for (const t of candidates) {
+    const frame = getWallCurveFrameAt(wall, t)
+    const distance = Math.hypot(planPoint[0] - frame.point.x, planPoint[1] - frame.point.y)
+    if (!best || distance < best.distance) best = { distance, t }
+  }
+  if (!best || best.distance > maxDistance) return null
+
+  const frame = getWallCurveFrameAt(wall, best.t)
+  const perpDistance =
+    (planPoint[0] - frame.point.x) * frame.normal.x +
+    (planPoint[1] - frame.point.y) * frame.normal.y
+  return {
+    distance: best.distance,
+    localX: wallLength * best.t,
+    perpDistance,
+    dirX: frame.tangent.x,
+    dirY: frame.tangent.y,
+    wallLength,
+  }
+}
+
+/** Resolve a plan point against one wall, including its curved centerline. */
+export function resolveWallAttachmentAtPlanPoint(
+  wall: WallNode,
+  planPoint: readonly [number, number],
+  maxDistance = WALL_SNAP_DISTANCE_M,
+): WallPlanAttachment | null {
+  if (!isCurvedWall(wall)) {
+    const dx = wall.end[0] - wall.start[0]
+    const dz = wall.end[1] - wall.start[1]
+    const wallLength = Math.hypot(dx, dz)
+    if (wallLength <= 1e-6) return null
+    const dirX = dx / wallLength
+    const dirY = dz / wallLength
+    const px = planPoint[0] - wall.start[0]
+    const pz = planPoint[1] - wall.start[1]
+    const localX = Math.max(0, Math.min(wallLength, px * dirX + pz * dirY))
+    const perpDistance = px * -dirY + pz * dirX
+    const closestX = wall.start[0] + dirX * localX
+    const closestZ = wall.start[1] + dirY * localX
+    const distance = Math.hypot(planPoint[0] - closestX, planPoint[1] - closestZ)
+    if (distance > maxDistance) return null
+    const side: 'front' | 'back' = perpDistance >= 0 ? 'front' : 'back'
+    return {
+      distance,
+      localX,
+      perpDistance,
+      side,
+      dirX,
+      dirY,
+      wallLength,
+      itemRotation: side === 'front' ? 0 : Math.PI,
+    }
+  }
+
+  const curvedHit = closestCurvedWallInPlan(wall, planPoint, maxDistance)
+  if (!curvedHit || curvedHit.distance > maxDistance) return null
+  const side: 'front' | 'back' = curvedHit.perpDistance >= 0 ? 'front' : 'back'
+  return {
+    distance: curvedHit.distance,
+    localX: curvedHit.localX,
+    perpDistance: curvedHit.perpDistance,
+    side,
+    dirX: curvedHit.dirX,
+    dirY: curvedHit.dirY,
+    wallLength: curvedHit.wallLength,
+    itemRotation: side === 'front' ? 0 : Math.PI,
+  }
+}
+
+export function projectPlanPointToWallLocalX(
+  wall: WallNode,
+  planPoint: readonly [number, number],
+): number {
+  return resolveWallAttachmentAtPlanPoint(wall, planPoint, Number.POSITIVE_INFINITY)?.localX ?? 0
+}
+
+/**
+ * Return the closest wall attachment target in plan space, including curved
+ * walls. This is deliberately separate from `findClosestWallInPlan`: doors,
+ * windows, and wall-mounted items still use the straight-wall-only opening
+ * query, while lean-to canopies have analytic curved-wall support.
+ */
+export function findClosestWallAttachmentInPlan(
+  planPoint: readonly [number, number],
+  nodes: Record<AnyNodeId, AnyNode>,
+  parentLevelId: AnyNodeId | null,
+  excludeWallId?: AnyNodeId,
+): WallHit | null {
+  if (!parentLevelId) return null
+  const level = nodes[parentLevelId]
+  const childIds = (level as unknown as { children?: AnyNodeId[] })?.children
+  if (!Array.isArray(childIds)) return null
+
+  let best: { hit: WallHit; distance: number } | null = null
+  for (const childId of childIds) {
+    const node = nodes[childId]
+    if (node?.type !== 'wall' || node.id === excludeWallId) continue
+    const attachment = resolveWallAttachmentAtPlanPoint(node, planPoint)
+    if (!attachment || (best && attachment.distance >= best.distance)) continue
+    best = { hit: { wall: node, ...attachment }, distance: attachment.distance }
+  }
+  return best?.hit ?? null
+}
+
 /** Figma-style along-wall alignment threshold (meters) — parity with the
  *  XZ placement / move threshold. */
 const ALONG_WALL_ALIGN_THRESHOLD_M = 0.08
@@ -118,8 +259,11 @@ const ALONG_WALL_ALIGN_THRESHOLD_M = 0.08
  *  footprint. */
 function wallAttachmentSpan(node: AnyNode): { center: number; half: number } | null {
   if (node.type === 'door' || node.type === 'window') {
-    const n = node as { position: [number, number, number]; width: number }
-    return { center: n.position[0], half: n.width / 2 }
+    const size = getDoorOpeningSize(node)
+    return {
+      center: node.position[0] - size.leafOffsetX * openingHostFacing(node),
+      half: size.width / 2,
+    }
   }
   if (node.type === 'item') {
     const item = node as ItemNode
@@ -190,75 +334,10 @@ export function snapLocalXToNeighbors(args: {
 }
 
 /**
- * Does a wall-hosted opening of `width × height` centred at `(clampedX,
- * clampedY)` (wall-local) overlap any OTHER child of `wallId` (door / window /
- * wall-mounted item)? AABB test in the wall's local face plane. `ignoreId`
- * excludes the moving node itself. Returns `true` (blocked) if the wall is
- * gone.
- *
- * Single source of truth for door + window placement collision — door-math and
- * window-math had byte-identical copies of this. Y conventions differ per kind
- * (items store bottom Y; doors/windows store centre Y), handled inline.
+ * Whether a wall-hosted opening would overlap another child of its wall. The rule lives in
+ * core, shared with every agent surface (`planWallOpening`); re-exported for the tools here.
  */
-export function hasWallChildOverlap(
-  wallId: string,
-  clampedX: number,
-  clampedY: number,
-  width: number,
-  height: number,
-  ignoreId?: string,
-): boolean {
-  const nodes = useScene.getState().nodes
-  const wallNode = nodes[wallId as AnyNodeId] as WallNode | undefined
-  if (!wallNode) return true
-  const halfW = width / 2
-  const halfH = height / 2
-  const newBottom = clampedY - halfH
-  const newTop = clampedY + halfH
-  const newLeft = clampedX - halfW
-  const newRight = clampedX + halfW
-
-  for (const childId of Array.isArray(wallNode.children) ? wallNode.children : []) {
-    if (childId === ignoreId) continue
-    const child = nodes[childId as AnyNodeId]
-    if (!child) continue
-
-    let childLeft: number
-    let childRight: number
-    let childBottom: number
-    let childTop: number
-
-    if (child.type === 'item') {
-      const item = child as ItemNode
-      if (item.asset.attachTo !== 'wall' && item.asset.attachTo !== 'wall-side') continue
-      const [w, h] = getScaledDimensions(item)
-      childLeft = item.position[0] - w / 2
-      childRight = item.position[0] + w / 2
-      childBottom = item.position[1] // items store bottom Y
-      childTop = item.position[1] + h
-    } else if (child.type === 'window') {
-      const win = child as { position: [number, number, number]; width: number; height: number }
-      childLeft = win.position[0] - win.width / 2
-      childRight = win.position[0] + win.width / 2
-      childBottom = win.position[1] - win.height / 2 // windows store centre Y
-      childTop = win.position[1] + win.height / 2
-    } else if (child.type === 'door') {
-      const door = child as { position: [number, number, number]; width: number; height: number }
-      childLeft = door.position[0] - door.width / 2
-      childRight = door.position[0] + door.width / 2
-      childBottom = door.position[1] - door.height / 2 // doors store centre Y
-      childTop = door.position[1] + door.height / 2
-    } else {
-      continue
-    }
-
-    const xOverlap = newLeft < childRight && newRight > childLeft
-    const yOverlap = newBottom < childTop && newTop > childBottom
-    if (xOverlap && yOverlap) return true
-  }
-
-  return false
-}
+export { hasWallChildOverlap } from '@pascal-app/core/building'
 
 /** Placement state for a wall-hosted opening — the SINGLE decision the preview
  *  tint and the commit gate both consume so they can never disagree. */
@@ -274,7 +353,7 @@ export type OpeningPlacement = {
 
 /**
  * Resolve the placement state from the raw collision result and whether the
- * user is force-placing (Shift). Force-place lifts the collision block, so the
+ * user is force-placing (held Alt). Force-place lifts the collision block, so the
  * opening becomes placeable AND the tint goes green — the preview and the
  * commit gate stay in lockstep because both read this one result.
  */

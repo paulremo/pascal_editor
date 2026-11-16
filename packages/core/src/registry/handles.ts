@@ -70,9 +70,23 @@ export type EditorApi = {
 
 export type HandlePortal = 'self' | 'parent' | 'grandparent'
 
+export type HandlePortalTarget<N> = (node: N, sceneApi: SceneApi) => AnyNodeId | null | undefined
+
 export type HandleAxis = 'x' | 'y' | 'z'
 
 export type HandleAnchor = 'center' | 'min' | 'max'
+
+/** Keyboard modifiers captured for a handle-resize tick. */
+export type HandleDragModifiers = {
+  readonly altKey: boolean
+  readonly shiftKey?: boolean
+}
+
+export type HandlePreviewSession<N> = {
+  preview: (patch: Partial<N>) => void
+  commit: (patch?: Partial<N>) => void
+  cancel: () => void
+}
 
 /** 3D position + rotation of the arrow in its portal target's local space. */
 export type HandlePlacement<N> = {
@@ -124,11 +138,32 @@ export type HandleDecoration<N> = {
  */
 export type LinearResizeHandle<N> = {
   kind: 'linear-resize'
-  /** Local axis. The arrow's chevron points along +axis. */
+  /** Local resize axis. */
   axis: HandleAxis
+  /** Local drag direction when the edited dimension follows a rotated path. */
+  dragAxis?: (node: N, sceneApi: SceneApi) => readonly [number, number, number]
+  /** Arrow and clearance direction. Drag growth remains controlled by `anchor`. */
+  direction?: 1 | -1
   anchor: HandleAnchor
   currentValue: (node: N) => number
-  apply: (node: N, newValue: number, sceneApi: SceneApi) => Partial<N>
+  apply: (
+    node: N,
+    newValue: number,
+    sceneApi: SceneApi,
+    modifiers?: HandleDragModifiers,
+  ) => Partial<N>
+  /**
+   * Additional live-only patches for geometry owned by related nodes. The
+   * editor publishes these during the drag and clears them on release or
+   * cancellation; committed scene writes remain the responsibility of
+   * `commit` (or the generic selected-node update).
+   */
+  previewOverrides?: (
+    node: N,
+    newValue: number,
+    sceneApi: SceneApi,
+    modifiers?: HandleDragModifiers,
+  ) => ReadonlyArray<readonly [AnyNodeId, Partial<AnyNode>]>
   /** Optional live-scene visibility gate for context-dependent arrows. */
   visible?: (node: N, sceneApi: SceneApi) => boolean
   /**
@@ -138,7 +173,7 @@ export type LinearResizeHandle<N> = {
    * final write here to fan the resize out to siblings / parents while keeping
    * the handle UI generic.
    */
-  commit?: (node: N, patch: Partial<N>, sceneApi: SceneApi) => void
+  commit?: (node: N, patch: Partial<N>, sceneApi: SceneApi, modifiers?: HandleDragModifiers) => void
   /**
    * Optional per-tick hook fired while this handle is being dragged, with the
    * live (in-progress, override-merged) node. A pure side-channel for transient
@@ -147,6 +182,12 @@ export type LinearResizeHandle<N> = {
    * by `apply`.
    */
   onDrag?: (node: N, sceneApi: SceneApi) => void
+  /**
+   * Cleanup companion to {@link onDrag}. Called for commit, cancellation, and
+   * unmount so a descriptor can release transient feedback it owns without the
+   * generic renderer knowing which guide store produced it.
+   */
+  onDragEnd?: (node: N, sceneApi: SceneApi) => void
   /**
    * Cross-node redirect. By default the drag's live override + the
    * committed write both land on the SELECTED node. When this returns
@@ -163,7 +204,22 @@ export type LinearResizeHandle<N> = {
   max?: number | ((node: N, sceneApi: SceneApi) => number)
   /** Snap the resized scalar to the editor's active grid step before apply. */
   gridSnap?: boolean
-  placement: HandlePlacement<N>
+  /** Kind-owned magnetic snap for the resized scalar, gated by the active snapping mode. */
+  magneticSnap?: (node: N, newValue: number, sceneApi: SceneApi) => number
+  /**
+   * Kind-owned structural connection snap. Unlike alignment snapping, this is
+   * active in every snapping mode and is bypassed only by the held Alt force
+   * modifier. Use it when the snapped result changes connectivity, such as two
+   * lean-to roof edges becoming one continuous run.
+   */
+  connectionSnap?: (node: N, newValue: number, sceneApi: SceneApi) => number
+  placement: HandlePlacement<N> & {
+    /** Opt-in minimum center distance from an edge along `direction` (default +1), in scaled arrow units. */
+    clearance?: {
+      edge: (node: N, sceneApi: SceneApi) => number
+      distance: number
+    }
+  }
   /**
    * Dimension this handle steers (e.g. `'height'`). When set, the editor
    * publishes it to `activeHandleDrag.label` for the duration of the drag
@@ -179,6 +235,7 @@ export type LinearResizeHandle<N> = {
    * need to ride the wall's rotation.
    */
   portal?: HandlePortal
+  portalTarget?: HandlePortalTarget<N>
   cursor?: Cursor
   /** Optional visual guide shown while the arrow is hovered or dragging. */
   decoration?: HandleDecoration<N>
@@ -241,8 +298,34 @@ export type RadialResizeHandle<N> = {
   max?: number | ((node: N, sceneApi: SceneApi) => number)
   placement: HandlePlacement<N>
   portal?: HandlePortal
+  portalTarget?: HandlePortalTarget<N>
   /** Optional visual guide shown while the arrow is hovered or dragging. */
   decoration?: HandleDecoration<N>
+}
+
+/**
+ * In-plane corner-radius knob. The editor places the knob diagonally inward
+ * from `corner` and converts its pointer position back into a radius. Holding
+ * Shift is exposed through `modifiers` so kinds can switch from a shared
+ * radius to per-corner radii without teaching the editor their schema.
+ */
+export type CornerRadiusHandle<N> = {
+  kind: 'corner-radius'
+  corner: readonly [x: -1 | 1, y: -1 | 1]
+  width: (node: N) => number
+  height: (node: N) => number
+  currentValue: (node: N) => number
+  max: number | ((node: N, sceneApi: SceneApi) => number)
+  apply: (
+    node: N,
+    newValue: number,
+    sceneApi: SceneApi,
+    modifiers: HandleDragModifiers,
+  ) => Partial<N>
+  createPreview?: (node: N) => HandlePreviewSession<N>
+  visible?: (node: N, sceneApi: SceneApi) => boolean
+  portal?: HandlePortal
+  portalTarget?: HandlePortalTarget<N>
 }
 
 /**
@@ -268,8 +351,10 @@ export type ArcResizeHandle<N = any> = {
   /** Optional metadata for descriptors that bundle two handles per kind. */
   end?: 'start' | 'end'
   apply: (initialNode: N, delta: number, sceneApi: SceneApi) => Partial<N>
+  visible?: (node: N, sceneApi: SceneApi) => boolean
   placement: HandlePlacement<N>
   portal?: HandlePortal
+  portalTarget?: HandlePortalTarget<N>
   /** Optional visual guide shown while the arrow is hovered or dragging. */
   decoration?: HandleDecoration<N>
   /**
@@ -278,6 +363,8 @@ export type ArcResizeHandle<N = any> = {
    * arrow icon, intended for whole-node rotation handles.
    */
   shape?: 'chevron' | 'rotate'
+  /** Disable the default 15° snap for whole-node rotation. */
+  continuous?: boolean
   /**
    * Plane the angular drag is measured in:
    *   - 'horizontal' (default): cursor bearing around +Y — whole-node yaw
@@ -315,6 +402,7 @@ export type EndpointMoveHandle<N> = {
   /** Called with the world-space hit on the ground plane. */
   apply: (node: N, worldPoint: readonly [number, number, number], sceneApi: SceneApi) => Partial<N>
   portal?: HandlePortal
+  portalTarget?: HandlePortalTarget<N>
 }
 
 // Default to `any` so type-erased renderers can hold `HandleDescriptor[]`
@@ -363,7 +451,9 @@ export type TapActionHandle<N = any> = {
    * stands it up against the node's facing plane (a wall face).
    */
   plane?: 'horizontal' | 'node-normal'
+  visible?: (node: N, sceneApi: SceneApi) => boolean
   portal?: HandlePortal
+  portalTarget?: HandlePortalTarget<N>
   cursor?: Cursor
 }
 
@@ -410,6 +500,7 @@ export type TranslateHandle<N = any> = {
    */
   snapExtents?: (node: N, sceneApi: SceneApi) => readonly [number, number] | null
   portal?: HandlePortal
+  portalTarget?: HandlePortalTarget<N>
 }
 
 /**
@@ -429,11 +520,13 @@ export type LatchHandle<N = any> = {
   group: string
   placement: HandlePlacement<N>
   portal?: HandlePortal
+  portalTarget?: HandlePortalTarget<N>
 }
 
 export type HandleDescriptor<N = any> =
   | LinearResizeHandle<N>
   | RadialResizeHandle<N>
+  | CornerRadiusHandle<N>
   | ArcResizeHandle<N>
   | EndpointMoveHandle<N>
   | TapActionHandle<N>
@@ -444,4 +537,6 @@ export type HandleDescriptor<N = any> =
  * Static array, or a function for shape-dependent cases (column
  * crossSection / supportStyle, stair-segment segmentType, etc.).
  */
-export type HandleList<N> = HandleDescriptor<N>[] | ((node: N) => HandleDescriptor<N>[])
+export type HandleList<N> =
+  | HandleDescriptor<N>[]
+  | ((node: N, sceneApi?: SceneApi) => HandleDescriptor<N>[])

@@ -6,12 +6,11 @@ import type {
   IconRef,
   NodeQuickAction,
 } from '@pascal-app/core'
-import { moduleSideOpen, sideInsertX } from './run-layout'
+import { moduleSideOpen } from './run-layout'
 import {
   addCabinetModuleSide,
   addCornerRun,
   addWallChildAbove,
-  CABINET_BASE_WIDTH,
   CABINET_EDGE_EPSILON,
   cabinetModulesForRun,
   planCabinetModuleSideAddition,
@@ -19,6 +18,7 @@ import {
   resolveCabinetType,
   switchCabinetToBase,
   switchCabinetToTall,
+  wallChildAdditionOverlaps,
   wallChildOf,
 } from './run-ops'
 
@@ -61,7 +61,6 @@ const cornerTurnRightIcon: IconRef = {
   kind: 'component',
   module: () => import('./quick-action-icons').then((m) => ({ default: m.CornerTurnRightGlyph })),
 }
-
 function resolveCabinetContext(
   node: AnyNode,
   nodes: Readonly<Partial<Record<AnyNodeId, AnyNode>>>,
@@ -91,6 +90,10 @@ export function cabinetQuickActions({
     context.module && standardModule && selectedCabinetType === 'base'
       ? Boolean(wallChildOf(context.module, nodes))
       : false
+  const wallAdditionBlocked =
+    context.module && standardModule && selectedCabinetType === 'base'
+      ? wallChildAdditionOverlaps(context.module, context.run, nodes)
+      : false
   const runModules = cabinetModulesForRun(context.run, nodes)
   const leftCornerModule =
     context.module && standardModule && selectedCabinetType === 'base'
@@ -100,24 +103,7 @@ export function cabinetQuickActions({
     context.module && standardModule && selectedCabinetType === 'base'
       ? context.module
       : resolveRunEndModule(runModules, context.run, 'right')
-  const leftHasInsertSlot =
-    sideInsertX({
-      anchorModule: context.module,
-      modules: runModules,
-      side: 'left',
-      width: CABINET_BASE_WIDTH,
-      epsilon: CABINET_EDGE_EPSILON,
-    }) != null
-  const rightHasInsertSlot =
-    sideInsertX({
-      anchorModule: context.module,
-      modules: runModules,
-      side: 'right',
-      width: CABINET_BASE_WIDTH,
-      epsilon: CABINET_EDGE_EPSILON,
-    }) != null
   const leftAvailable =
-    leftHasInsertSlot &&
     planCabinetModuleSideAddition({
       anchorModule: context.module,
       nodes,
@@ -125,7 +111,6 @@ export function cabinetQuickActions({
       side: 'left',
     }) != null
   const rightAvailable =
-    rightHasInsertSlot &&
     planCabinetModuleSideAddition({
       anchorModule: context.module,
       nodes,
@@ -210,9 +195,12 @@ export function cabinetQuickActions({
         label: 'Wall',
         title: hasWallCabinet
           ? 'A wall cabinet already exists above this cabinet'
-          : 'Add wall cabinet above',
+          : wallAdditionBlocked
+            ? 'No space above—overlaps an existing wall cabinet'
+            : 'Add wall cabinet above',
         icon: cabinetWallIcon,
-        disabled: hasWallCabinet,
+        disabled: hasWallCabinet || wallAdditionBlocked,
+        blockedFeedback: !hasWallCabinet && wallAdditionBlocked ? true : undefined,
         run: ({ sceneApi }) => {
           const id = addWallChildAbove({
             kind: 'cabinet',

@@ -1,13 +1,6 @@
-import type {
-  AnyNode,
-  AnyNodeId,
-  CeilingNode,
-  ElevatorNode,
-  LevelNode,
-  WallNode,
-} from '../../schema'
-
-export const DEFAULT_ELEVATOR_LEVEL_HEIGHT = 2.5
+import type { AnyNode, AnyNodeId, ElevatorNode, LevelNode } from '../../schema'
+import { getLevelElevations } from '../../services/storey'
+import { resolveElevatorDimensions } from './elevator-geometry'
 
 export type ElevatorLevelEntry = {
   id: LevelNode['id']
@@ -16,10 +9,17 @@ export type ElevatorLevelEntry = {
 }
 
 function getBuildingLevels(elevator: ElevatorNode, nodes: Record<string, AnyNode>): LevelNode[] {
+  const parent = elevator.parentId ? nodes[elevator.parentId as AnyNodeId] : undefined
+  // Older saves attach elevators to a level. Opening queries must agree before
+  // and after client hydration reparents them to the owning building.
   const building =
-    elevator.parentId && nodes[elevator.parentId as AnyNodeId]?.type === 'building'
-      ? nodes[elevator.parentId as AnyNodeId]
-      : null
+    parent?.type === 'level'
+      ? parent.parentId && nodes[parent.parentId]?.type === 'building'
+        ? nodes[parent.parentId]
+        : Object.values(nodes).find(
+            (node) => node.type === 'building' && node.children.includes(parent.id),
+          )
+      : parent
 
   if (building?.type !== 'building') return []
 
@@ -81,29 +81,7 @@ export function resolveElevatorServiceLevels(
   return levels.slice(minIndex, maxIndex + 1)
 }
 
-export function getElevatorLevelHeight(levelId: string, nodes: Record<string, AnyNode>): number {
-  const level = nodes[levelId as AnyNodeId] as LevelNode | undefined
-  if (level?.type !== 'level') return DEFAULT_ELEVATOR_LEVEL_HEIGHT
-
-  let maxTop = 0
-
-  for (const childId of level.children) {
-    const child = nodes[childId as AnyNodeId]
-    if (!child) continue
-
-    if (child.type === 'ceiling') {
-      const height = (child as CeilingNode).height ?? DEFAULT_ELEVATOR_LEVEL_HEIGHT
-      if (height > maxTop) maxTop = height
-    } else if (child.type === 'wall') {
-      const height = (child as WallNode).height ?? DEFAULT_ELEVATOR_LEVEL_HEIGHT
-      if (height > maxTop) maxTop = height
-    }
-  }
-
-  return maxTop > 0 ? maxTop : DEFAULT_ELEVATOR_LEVEL_HEIGHT
-}
-
-export function resolveElevatorLevels(
+function computeElevatorLevels(
   elevator: ElevatorNode,
   nodes: Record<string, AnyNode>,
 ): {
@@ -113,20 +91,18 @@ export function resolveElevatorLevels(
   shaftTopY: number
   totalHeight: number
 } {
+  const dimensions = resolveElevatorDimensions(elevator)
+  const cabHeight = dimensions.cabHeight
+  // Keep the cab below the cap even when a thick shaft wall also makes a thick cap.
+  const topClearance = Math.max(0.3, dimensions.shaftWallThickness + 0.01)
   const allLevels = resolveElevatorBuildingLevels(elevator, nodes)
-
-  const baseYByLevelId = new Map<string, number>()
-  let cumulativeY = 0
-  for (const level of allLevels) {
-    baseYByLevelId.set(level.id, cumulativeY)
-    cumulativeY += getElevatorLevelHeight(level.id, nodes)
-  }
+  const levelElevations = getLevelElevations(nodes as Record<AnyNodeId, AnyNode>)
 
   const serviceLevels = resolveElevatorServiceLevels(elevator, nodes)
   const entries = serviceLevels.map((level) => ({
     id: level.id,
     label: String(level.level),
-    baseY: baseYByLevelId.get(level.id) ?? 0,
+    baseY: levelElevations.get(level.id)?.baseY ?? 0,
   }))
 
   const defaultEntry =
@@ -136,22 +112,56 @@ export function resolveElevatorLevels(
     null
   const firstServedLevel = serviceLevels[0] ?? null
   const lastServedLevel = serviceLevels[serviceLevels.length - 1] ?? null
-  const shaftBaseY = firstServedLevel ? (baseYByLevelId.get(firstServedLevel.id) ?? 0) : 0
+  const shaftBaseY = firstServedLevel ? (levelElevations.get(firstServedLevel.id)?.baseY ?? 0) : 0
   const lastServedIndex = lastServedLevel
     ? allLevels.findIndex((level) => level.id === lastServedLevel.id)
     : -1
   const nextLevel = lastServedIndex >= 0 ? allLevels[lastServedIndex + 1] : null
-  const shaftTopY = nextLevel
-    ? (baseYByLevelId.get(nextLevel.id) ?? cumulativeY)
+  // Highest ceiling in the stack, not the topmost level's: a negative
+  // baseElevation on the top level can put its ceiling below the level
+  // beneath it, and a shaft top under a served level would clip the cab.
+  let stackTopY = 0
+  for (const level of allLevels) {
+    const elevation = levelElevations.get(level.id)
+    if (!elevation) continue
+    stackTopY = Math.max(stackTopY, elevation.baseY + elevation.height)
+  }
+  const configuredTopY = nextLevel
+    ? (levelElevations.get(nextLevel.id)?.baseY ?? stackTopY)
     : lastServedLevel
-      ? cumulativeY
-      : elevator.cabHeight + 0.3
+      ? stackTopY
+      : cabHeight + topClearance
+
+  const shaftTopY = Math.max(
+    configuredTopY,
+    shaftBaseY + cabHeight + topClearance,
+    ...entries.map((entry) => entry.baseY + cabHeight + topClearance),
+  )
 
   return {
     entries,
     defaultEntry,
     shaftBaseY,
     shaftTopY,
-    totalHeight: Math.max(shaftTopY - shaftBaseY, elevator.cabHeight + 0.3),
+    totalHeight: Math.max(shaftTopY - shaftBaseY, cabHeight + topClearance),
   }
+}
+
+const levelCache = new WeakMap<
+  Record<string, AnyNode>,
+  WeakMap<ElevatorNode, ReturnType<typeof computeElevatorLevels>>
+>()
+
+export function resolveElevatorLevels(elevator: ElevatorNode, nodes: Record<string, AnyNode>) {
+  let cache = levelCache.get(nodes)
+  if (!cache) {
+    cache = new WeakMap()
+    levelCache.set(nodes, cache)
+  }
+  let resolved = cache.get(elevator)
+  if (!resolved) {
+    resolved = computeElevatorLevels(elevator, nodes)
+    cache.set(elevator, resolved)
+  }
+  return resolved
 }

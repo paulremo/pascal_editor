@@ -79,7 +79,15 @@ export function getRidgeVentLinesForSegment(segment: RoofSegmentNode): RidgeVent
     trim: UNTRIMMED_RIDGE_VENT_BOUNDS_TRIM,
   })
   const { width, depth, minX, maxX, minZ, maxZ } = bounds
-  if (segment.roofType === 'flat' || segment.roofType === 'shed') return []
+  if (
+    segment.roofSystem === 'glazed' ||
+    segment.roofType === 'barrel' ||
+    segment.roofType === 'flat' ||
+    segment.roofType === 'shed' ||
+    segment.roofType === 'conical'
+  ) {
+    return []
+  }
 
   const halfW = width / 2
   const halfD = depth / 2

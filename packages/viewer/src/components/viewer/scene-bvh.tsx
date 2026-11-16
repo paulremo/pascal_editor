@@ -24,6 +24,8 @@ type SceneBvhProps = {
 const isMesh = (object: unknown): object is Mesh =>
   !!object && typeof object === 'object' && (object as Mesh).isMesh === true
 
+export const isSceneBvhExcluded = (object: Mesh) => object.userData.excludeFromBvh === true
+
 const hasBvhCompatibleGeometry = (geometry?: BufferGeometry | null) => {
   if (!geometry) return false
 
@@ -62,7 +64,7 @@ export const SceneBvh = forwardRef<Group, SceneBvhProps>(
         verbose,
         setBoundingBox,
         maxDepth,
-        maxLeafSize,
+        targetLeafSize: maxLeafSize,
         indirect,
       }
       const group = ref.current
@@ -73,6 +75,7 @@ export const SceneBvh = forwardRef<Group, SceneBvhProps>(
 
       group.traverse((child) => {
         if (!isMesh(child)) return
+        if (isSceneBvhExcluded(child)) return
 
         if (child.raycast === Mesh.prototype.raycast) {
           child.raycast = acceleratedRaycast

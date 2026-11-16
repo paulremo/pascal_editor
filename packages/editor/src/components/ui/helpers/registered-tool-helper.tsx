@@ -1,7 +1,9 @@
+import { usePascalI18n } from '@pascal-app/core'
 import type { ToolHint } from '@pascal-app/core'
 import type { ContinuationContext } from '../../../lib/continuation'
+import type { HudTitle } from '../../../lib/hud-title'
 import type { SnapContext } from '../../../lib/snapping-mode'
-import useEditor from '../../../store/use-editor'
+import { useVisibleToolHints } from '../../../lib/panel-tool-options'
 import { ContextualHelperPanel } from './contextual-helper-panel'
 
 /**
@@ -18,23 +20,19 @@ export function RegisteredToolHelper({
   shiftPressed = false,
   snapContext = null,
   continuationContext = null,
+  title = null,
+  notice = null,
 }: {
   hints: ToolHint[]
   shiftPressed?: boolean
   snapContext?: SnapContext | null
   continuationContext?: ContinuationContext | null
+  title?: HudTitle | null
+  notice?: string | null
 }) {
-  // Live vertex count of an in-progress polygon draft, so hints gated on a
-  // minimum (e.g. "Finish" at ≥ 3) only appear once they're actually possible.
-  const draftVertexCount = useEditor((s) => s.draftVertexCount)
-  // Some hints are replaced by live contextual chips, so keep the generic
-  // registry renderer from duplicating stale/static versions.
-  const visible = hints.filter(
-    (hint) =>
-      !(hint.key === 'Shift' && hint.label === 'Cycle snapping mode') &&
-      (hint.minDraftVertices == null || draftVertexCount >= hint.minDraftVertices),
-  )
-  if (visible.length === 0 && !snapContext && !continuationContext) return null
+  const i18n = usePascalI18n()
+  const visible = useVisibleToolHints(hints)
+  if (visible.length === 0 && !snapContext && !continuationContext && !notice) return null
   // Hints carrying a live-state `chip` render as mode chips next to the
   // snapping / continuation rows; the rest stay static key rows.
   const chipHints = visible.filter((hint) => hint.chip)
@@ -48,12 +46,14 @@ export function RegisteredToolHelper({
         const isBypassHint = hint.key === 'Shift'
         return {
           keys: [hint.key],
-          label: shiftPressed && isBypassHint ? 'Guided constraints bypassed' : hint.label,
+          label: shiftPressed && isBypassHint ? i18n._({ id: 'editor.helpers.registeredToolHelper.guidedConstraintsBypassed', message: 'Guided constraints bypassed' }) : hint.label,
           active: shiftPressed && isBypassHint,
         }
       })}
       continuationContext={continuationContext}
+      notice={notice}
       snapContext={snapContext}
+      title={title}
     />
   )
 }

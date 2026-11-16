@@ -1,7 +1,62 @@
 import type { ZodObject } from 'zod'
-import type { AnyNodeDefinition, BakePolicy, NodeRegistry, Plugin } from './types'
+import type { AnyNode } from '../schema'
+import type {
+  AnyNodeDefinition,
+  BakePolicy,
+  FloorPlacedConfig,
+  FloorplanScope,
+  InspectorExtension,
+  NodeRegistry,
+  Plugin,
+} from './types'
 
 const HOST_API_VERSION = 1 as const
+const BUILTIN_PLUGIN_ID = 'pascal:core'
+
+const pluginIdsByKind = new Map<string, string>()
+
+// Inspector-card sections contributed by plugins, fanned out per node kind
+// (`Plugin.inspectorExtensions`). Filled by `loadPlugin`, cleared by the
+// test reset alongside `pluginIdsByKind`. Consumers re-derive on the
+// registry-version bump — plugins load asynchronously, after first mount.
+const inspectorExtensionsByKind = new Map<string, InspectorExtension[]>()
+
+// ---------------------------------------------------------------------------
+// Registry change notification. Plugin kinds register ASYNCHRONOUSLY (app
+// bootstraps discover them via dynamic imports — see `discoverPlugins`), so
+// any consumer that snapshots the registry at mount (the selection managers'
+// `getSelectableKinds()` subscription lists) goes stale the moment a plugin
+// loads after it. `_register` / `_reset` bump a monotonic version and notify
+// listeners; `useRegistryVersion()` (registry/use-registry-version.ts) turns
+// that into a React re-render so effects can re-derive their kind lists.
+// ---------------------------------------------------------------------------
+
+let registryVersion = 0
+const registryListeners = new Set<() => void>()
+
+function notifyRegistryChanged(): void {
+  registryVersion += 1
+  // Copy before iterating — a listener may unsubscribe (or subscribe) as a
+  // consequence of the notification.
+  for (const listener of [...registryListeners]) listener()
+}
+
+/** Monotonic counter, bumped on every kind registration (and test reset). */
+export function getRegistryVersion(): number {
+  return registryVersion
+}
+
+/**
+ * Subscribe to registry changes (a kind registered via {@link registerNode}
+ * / {@link loadPlugin}, or a test reset). Returns the unsubscribe function.
+ * `useSyncExternalStore`-compatible.
+ */
+export function onRegistryChange(listener: () => void): () => void {
+  registryListeners.add(listener)
+  return () => {
+    registryListeners.delete(listener)
+  }
+}
 
 // True in dev / test builds, false in production. Tries Vite's
 // `import.meta.env.DEV` first (the editor app's bundler) and falls back
@@ -18,6 +73,21 @@ function isDevMode(): boolean {
   }
   // No environment signal — be safe and treat as production.
   return false
+}
+
+function assertValidDefinition(def: AnyNodeDefinition): void {
+  if (typeof def.kind !== 'string' || def.kind.length === 0) {
+    throw new Error('[registry] NodeDefinition.kind must be a non-empty string')
+  }
+  if (typeof def.schemaVersion !== 'number' || def.schemaVersion < 1) {
+    throw new Error(
+      `[registry] NodeDefinition.schemaVersion must be a positive integer (kind: "${def.kind}")`,
+    )
+  }
+}
+
+function duplicateKindError(kind: string): Error {
+  return new Error(`[registry] duplicate node kind: "${kind}" already registered`)
 }
 
 class NodeRegistryImpl implements NodeRegistry {
@@ -45,14 +115,7 @@ class NodeRegistryImpl implements NodeRegistry {
 
   // Internal — exposed via registerNode below.
   _register(def: AnyNodeDefinition): void {
-    if (typeof def.kind !== 'string' || def.kind.length === 0) {
-      throw new Error('[registry] NodeDefinition.kind must be a non-empty string')
-    }
-    if (typeof def.schemaVersion !== 'number' || def.schemaVersion < 1) {
-      throw new Error(
-        `[registry] NodeDefinition.schemaVersion must be a positive integer (kind: "${def.kind}")`,
-      )
-    }
+    assertValidDefinition(def)
     // Duplicate-kind handling depends on environment:
     //   - **Production**: throw. The plugin-authoring contract
     //     (`wiki/architecture/plugin-authoring.md`) guarantees that two
@@ -65,25 +128,96 @@ class NodeRegistryImpl implements NodeRegistry {
       if (isDevMode()) {
         console.warn(`[registry] re-registering node kind "${def.kind}" (HMR)`)
       } else {
-        throw new Error(`[registry] duplicate node kind: "${def.kind}" already registered`)
+        throw duplicateKindError(def.kind)
       }
     }
     this.defs.set(def.kind, def)
+    notifyRegistryChanged()
+  }
+
+  // Internal to `loadPlugin`: stores already-validated definitions without
+  // notifying, so a plugin commits all of its state before listeners run.
+  _commit(defs: readonly AnyNodeDefinition[]): void {
+    for (const def of defs) {
+      if (this.defs.has(def.kind)) {
+        console.warn(`[registry] re-registering node kind "${def.kind}" (HMR)`)
+      }
+      this.defs.set(def.kind, def)
+    }
   }
 
   // Test-only — clears the registry. Not exported from the package barrel.
   _reset(): void {
     this.defs.clear()
+    pluginIdsByKind.clear()
+    inspectorExtensionsByKind.clear()
+    notifyRegistryChanged()
+  }
+
+  // Test-only — captures the registry (definitions + plugin bookkeeping) and
+  // returns a restore function. The registry is a module singleton and bun
+  // runs a package's test files sequentially in ONE process, so a test that
+  // registers a throwaway kind (or `_reset()`s) without restoring leaks that
+  // state into every later test FILE — and file order varies by platform
+  // (macOS vs CI Linux), which turns the leak into an order-dependent flake.
+  // Wrap registry mutations in `const restore = nodeRegistry._snapshot()`
+  // + `restore()` in `afterEach`/`finally`.
+  _snapshot(): () => void {
+    const defs = new Map(this.defs)
+    const pluginIds = new Map(pluginIdsByKind)
+    const extensions = new Map(
+      Array.from(inspectorExtensionsByKind, ([kind, list]) => [kind, [...list]] as const),
+    )
+    return () => {
+      this.defs.clear()
+      for (const [kind, def] of defs) this.defs.set(kind, def)
+      pluginIdsByKind.clear()
+      for (const [kind, id] of pluginIds) pluginIdsByKind.set(kind, id)
+      inspectorExtensionsByKind.clear()
+      for (const [kind, list] of extensions) inspectorExtensionsByKind.set(kind, [...list])
+      notifyRegistryChanged()
+    }
   }
 }
+
+const registryImpl = new NodeRegistryImpl()
 
 export const nodeRegistry: NodeRegistry & {
   _register: (def: AnyNodeDefinition) => void
   _reset: () => void
-} = new NodeRegistryImpl()
+  _snapshot: () => () => void
+} = registryImpl
 
 export function registerNode(def: AnyNodeDefinition): void {
   nodeRegistry._register(def)
+}
+
+/** The plugin that registered a node kind, when it came through {@link loadPlugin}. */
+export function getNodePluginId(kind: string): string | undefined {
+  return pluginIdsByKind.get(kind)
+}
+
+/**
+ * Inspector-card sections registered for a node kind
+ * ({@link InspectorExtension}), in plugin load order. Callers must still
+ * apply the project's install gate (`installedPlugins` — same rule as
+ * {@link isNodeKindEnabled}) before rendering. Re-derive on the
+ * registry-version bump: plugins register asynchronously after mount.
+ */
+export function getInspectorExtensions(kind: string): InspectorExtension[] {
+  return inspectorExtensionsByKind.get(kind) ?? []
+}
+
+/**
+ * Whether a registered kind should participate in a project. Kinds registered
+ * directly by the host and the built-in plugin are always enabled. An omitted
+ * install list means a legacy scene whose plugin state predates persistence, so
+ * loaded plugins remain visible for backward compatibility.
+ */
+export function isNodeKindEnabled(kind: string, installedPlugins?: readonly string[]): boolean {
+  const pluginId = getNodePluginId(kind)
+  if (!pluginId || pluginId === BUILTIN_PLUGIN_ID || installedPlugins === undefined) return true
+  return installedPlugins.includes(pluginId)
 }
 
 /**
@@ -99,7 +233,7 @@ export function registerNode(def: AnyNodeDefinition): void {
 export function getSelectableKinds(): string[] {
   const result: string[] = []
   for (const [kind, def] of nodeRegistry.entries()) {
-    if (def.capabilities.selectable !== undefined) {
+    if (def.capabilities.selectable) {
       result.push(kind)
     }
   }
@@ -111,17 +245,35 @@ export function getSelectableKinds(): string[] {
  * in expression chains like `if (node.type === 'wall' || isRegistrySelectable(node.type))`.
  */
 export function isRegistrySelectable(kind: string): boolean {
-  return nodeRegistry.get(kind)?.capabilities.selectable !== undefined
+  return Boolean(nodeRegistry.get(kind)?.capabilities.selectable)
+}
+
+/** Whether `node` takes part in floor-placement collision (`FloorPlacedConfig.collides`). */
+export function floorPlacedCollides(
+  floorPlaced: FloorPlacedConfig | undefined,
+  node: AnyNode,
+): boolean {
+  const collides = floorPlaced?.collides
+  return typeof collides === 'function' ? collides(node) : collides === true
+}
+
+/**
+ * Whether the editor should apply its material-based selection highlight to a
+ * kind. Selection highlighting is enabled by default, including for legacy or
+ * unregistered kinds; definitions may explicitly opt out.
+ */
+export function isSelectionHighlightEnabled(kind: string): boolean {
+  return nodeRegistry.get(kind)?.capabilities.selectionHighlight !== false
 }
 
 /**
  * Kinds whose `def.floorplanScope` matches the requested scope. Used by
- * `FloorplanRegistryLayer` to discover building-scoped kinds (e.g.
- * elevator) without hardcoding kind names in the editor layer. `'level'`
- * is the default, so `kindsWithFloorplanScope('level')` includes kinds
- * that didn't set the field at all.
+ * `FloorplanRegistryLayer` to discover building- and site-scoped kinds
+ * without hardcoding kind names in the editor layer. `'level'` is the
+ * default, so `kindsWithFloorplanScope('level')` includes kinds that
+ * didn't set the field at all.
  */
-export function kindsWithFloorplanScope(scope: 'level' | 'building'): string[] {
+export function kindsWithFloorplanScope(scope: FloorplanScope): string[] {
   const result: string[] = []
   for (const [kind, def] of nodeRegistry.entries()) {
     const declared = def.floorplanScope ?? 'level'
@@ -133,8 +285,8 @@ export function kindsWithFloorplanScope(scope: 'level' | 'building'): string[] {
 /**
  * A kind's {@link BakePolicy} from the registry, defaulting to `'static'` for
  * kinds that don't declare one (or aren't registered). The bake and the baked
- * `/viewer` consult this instead of hardcoding kind names — see
- * plans/editor-plugin-trees-example.md → Part D.
+ * `/viewer` consult this instead of hardcoding kind names — see "Bake policy" in
+ * wiki/architecture/node-definitions.md.
  */
 export function bakePolicyOf(kind: string): BakePolicy {
   return nodeRegistry.get(kind)?.bake ?? 'static'
@@ -164,6 +316,16 @@ export function isRegistryMovable(kind: string): boolean {
   if (def.floorplanMoveTarget !== undefined) return true
   if (def.affordanceTools?.move !== undefined) return true
   return false
+}
+
+/**
+ * Whether Duplicate, copy and paste may clone this node: its kind is not
+ * `duplicable: false` and its `duplicable.allow` (if any) accepts it.
+ */
+export function isNodeDuplicable(node: AnyNode): boolean {
+  const duplicable = nodeRegistry.get(node.type)?.capabilities.duplicable
+  if (duplicable === false) return false
+  return typeof duplicable === 'object' && duplicable.allow ? duplicable.allow({ node }) : true
 }
 
 /**
@@ -242,8 +404,49 @@ export async function loadPlugin(plugin: Plugin): Promise<void> {
       `[registry] plugin "${plugin.id}" requires apiVersion ${plugin.apiVersion}; host supports ${HOST_API_VERSION}`,
     )
   }
-  for (const def of plugin.nodes ?? []) {
-    registerNode(def)
+  // Validate every definition and extension first, then commit all state,
+  // then notify once: a rejected plugin leaves nothing behind, and a listener
+  // (which may throw) only ever sees the whole plugin.
+  const nodes = plugin.nodes ?? []
+  const kinds = new Set<string>()
+  for (const def of nodes) {
+    assertValidDefinition(def)
+    if (!isDevMode() && (kinds.has(def.kind) || nodeRegistry.has(def.kind))) {
+      throw duplicateKindError(def.kind)
+    }
+    kinds.add(def.kind)
+  }
+  const extensions = plugin.inspectorExtensions ?? []
+  for (const extension of extensions) {
+    if (
+      typeof extension?.id !== 'string' ||
+      !Array.isArray(extension.kinds) ||
+      !extension.kinds.every((kind) => typeof kind === 'string' && kind.length > 0)
+    ) {
+      throw new Error(
+        `[registry] plugin "${plugin.id}" has an invalid inspector extension "${String(extension?.id)}": kinds must be an array of node kinds`,
+      )
+    }
+  }
+
+  registryImpl._commit(nodes)
+  for (const def of nodes) pluginIdsByKind.set(def.kind, plugin.id)
+  for (const extension of extensions) {
+    for (const kind of extension.kinds) {
+      const list = inspectorExtensionsByKind.get(kind)
+      if (!list) {
+        inspectorExtensionsByKind.set(kind, [extension])
+        continue
+      }
+      // Same-id re-registration replaces in place (dev HMR re-runs
+      // `loadPlugin`); a fresh id appends in load order.
+      const existing = list.findIndex((e) => e.id === extension.id)
+      if (existing >= 0) list[existing] = extension
+      else list.push(extension)
+    }
+  }
+  if (nodes.length > 0 || extensions.some((extension) => extension.kinds.length > 0)) {
+    notifyRegistryChanged()
   }
 }
 

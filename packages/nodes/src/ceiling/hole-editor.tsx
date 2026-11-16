@@ -1,7 +1,13 @@
 'use client'
 
-import { type CeilingNode, resolveLevelId, useLiveNodeOverrides, useScene } from '@pascal-app/core'
-import { PolygonEditor } from '@pascal-app/editor'
+import {
+  type CeilingNode,
+  resolveCeilingHeight,
+  resolveLevelId,
+  useLiveNodeOverrides,
+  useScene,
+} from '@pascal-app/core'
+import { PolygonEditor, setCeilingHoles } from '@pascal-app/editor'
 import { useViewer } from '@pascal-app/viewer'
 import { useCallback, useEffect } from 'react'
 
@@ -13,7 +19,6 @@ export const CeilingHoleEditor: React.FC<{
   holeIndex: number
 }> = ({ ceilingId, holeIndex }) => {
   const ceilingNode = useScene((s) => s.nodes[ceilingId])
-  const updateNode = useScene((s) => s.updateNode)
   const markDirty = useScene((s) => s.markDirty)
   const setSelection = useViewer((s) => s.setSelection)
 
@@ -25,10 +30,10 @@ export const CeilingHoleEditor: React.FC<{
     (newPolygon: Array<[number, number]>) => {
       const updatedHoles = [...holes]
       updatedHoles[holeIndex] = newPolygon
-      updateNode(ceilingId, { holes: updatedHoles })
+      setCeilingHoles(ceilingId, { holes: updatedHoles })
       setSelection({ selectedIds: [ceilingId] })
     },
-    [ceilingId, holeIndex, holes, updateNode, setSelection],
+    [ceilingId, holeIndex, holes, setSelection],
   )
 
   const handlePolygonPreview = useCallback(
@@ -64,7 +69,7 @@ export const CeilingHoleEditor: React.FC<{
       onPolygonChange={handlePolygonChange}
       onPolygonPreview={handlePolygonPreview}
       polygon={hole}
-      surfaceHeight={ceiling.height ?? 2.5}
+      surfaceHeight={resolveCeilingHeight(ceiling, useScene.getState().nodes)}
     />
   )
 }

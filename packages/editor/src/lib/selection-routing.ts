@@ -1,19 +1,74 @@
 import {
   type AnyNode,
-  type ItemNode,
+  type AnyNodeId,
+  type BuildingNode,
+  emitter,
   nodeRegistry,
   resolveSelectionProxyId,
+  useScene,
 } from '@pascal-app/core'
+import { useViewer } from '@pascal-app/viewer'
+import type { SelectionModifierKeys } from '@pascal-app/viewer/ui'
+import useEditor from '../store/use-editor'
+import { emitDeleteSFX } from './sfx-bus'
 
-export type SelectionModifierKeys = {
-  meta: boolean
-  ctrl: boolean
-  shift: boolean
+export function resolveCanvasBuildingId(
+  node: AnyNode,
+  nodes: Record<string, AnyNode>,
+): BuildingNode['id'] | null {
+  const visited = new Set<string>()
+  let current: AnyNode | undefined = node
+  while (current && !visited.has(current.id)) {
+    if (current.type === 'building') return current.id
+    visited.add(current.id)
+    current = current.parentId ? nodes[current.parentId] : undefined
+  }
+  return null
 }
 
-export type NodeSelectionTarget = {
-  phase: 'site' | 'structure' | 'furnish'
-  structureLayer?: 'zones' | 'elements'
+export function enterBuildingFromCanvas(node: AnyNode): boolean {
+  if (useEditor.getState().phase !== 'site' || useEditor.getState().mode !== 'select') return false
+  const buildingId = resolveCanvasBuildingId(node, useScene.getState().nodes)
+  if (!buildingId) return false
+  useViewer.getState().setSelection({ buildingId, selectedIds: [] })
+  useEditor.getState().setPhase('building')
+  return true
+}
+
+/**
+ * A floor-plan click from site, entry or background hit alike: a hit on any of
+ * a building's elements picks that building and goes inside, as in 3D.
+ */
+export function enterBuildingFromPlanHit(hitId: string | null): boolean {
+  const node = hitId ? useScene.getState().nodes[hitId as AnyNodeId] : undefined
+  return node ? enterBuildingFromCanvas(node) : false
+}
+
+/** A Delete-mode click on a plan entry: the sledgehammer, not a selection. */
+/**
+ * A canvas click (2D or 3D) selected `node`: publish it on
+ * `selection:canvas-node-click`, which plugins listen for. In Delete mode the
+ * click deletes the node instead.
+ */
+export function emitCanvasNodeSelection(node: AnyNode): void {
+  if (useEditor.getState().mode === 'delete') {
+    deleteNodeFromCanvas(node)
+    return
+  }
+  emitter.emit('selection:canvas-node-click', node)
+}
+
+export function deleteNodeFromCanvas(node: AnyNode): void {
+  const scene = useScene.getState()
+  if (scene.readOnly) return
+
+  emitDeleteSFX(node.type)
+  scene.deleteNode(node.id as AnyNodeId)
+  if (node.parentId) scene.dirtyNodes.add(node.parentId as AnyNodeId)
+  useViewer.getState().setSelection({ selectedIds: [] })
+  if (useViewer.getState().hoveredId === node.id) {
+    useViewer.setState({ hoveredId: null })
+  }
 }
 
 function shouldBypassSelectionProxy(node: AnyNode, target: AnyNode): boolean {
@@ -36,7 +91,7 @@ export function resolveCanvasSelectionNode({
   const proxiedTarget = nodes[resolveSelectionProxyId(node, nodes)] ?? node
   let target = shouldBypassSelectionProxy(node, proxiedTarget) ? node : proxiedTarget
   const parentFrame = nodeRegistry.get(target.type)?.capabilities?.movable?.parentFrame
-  if (parentFrame) {
+  if (parentFrame && !parentFrame.independent) {
     const parent = parentFrame.resolveParent(target, nodes as Readonly<Record<string, AnyNode>>)
     if (parent && selectedIds.length === 1 && selectedIds[0] === parent.id) {
       target = parent
@@ -49,45 +104,19 @@ export function isSelectionModifierActive(keys: SelectionModifierKeys): boolean 
   return keys.meta || keys.ctrl || keys.shift
 }
 
-export function selectionModifiersFromEvent(
-  event?: {
-    metaKey?: boolean
-    ctrlKey?: boolean
-    shiftKey?: boolean
-    nativeEvent?: {
-      metaKey?: boolean
-      ctrlKey?: boolean
-      shiftKey?: boolean
-    }
-  } | null,
-  fallback?: Partial<SelectionModifierKeys>,
-): SelectionModifierKeys {
-  const fromEvent = (
-    key: keyof SelectionModifierKeys,
-    eventKey: 'metaKey' | 'ctrlKey' | 'shiftKey',
-  ) => {
-    if (typeof event?.[eventKey] === 'boolean') return event[eventKey]
-    if (typeof event?.nativeEvent?.[eventKey] === 'boolean') return event.nativeEvent[eventKey]
-    return Boolean(fallback?.[key])
-  }
-
-  return {
-    meta: fromEvent('meta', 'metaKey'),
-    ctrl: fromEvent('ctrl', 'ctrlKey'),
-    shift: fromEvent('shift', 'shiftKey'),
-  }
-}
-
 export function resolveSelectedIdsForNodeClick({
   baseSelectedIds,
   currentSelectedIds,
   modifierKeys,
   nodeId,
+  expandIdsForNode,
 }: {
   baseSelectedIds?: readonly string[]
   currentSelectedIds: readonly string[]
   modifierKeys: SelectionModifierKeys
   nodeId: string
+  /** Session-group expand on plain click (not on modifier/Alt). */
+  expandIdsForNode?: (nodeId: string) => string[] | null
 }): string[] {
   if (isSelectionModifierActive(modifierKeys)) {
     const selectedIds = baseSelectedIds ?? currentSelectedIds
@@ -97,6 +126,12 @@ export function resolveSelectedIdsForNodeClick({
     return [...selectedIds, nodeId]
   }
 
+  if (modifierKeys.alt) {
+    return [nodeId]
+  }
+
+  const expanded = expandIdsForNode?.(nodeId)
+  if (expanded && expanded.length > 1) return expanded
   return [nodeId]
 }
 
@@ -115,61 +150,4 @@ export function shouldPreserveSelectedRoofHostTarget({
     selectedIds.length === 1 &&
     selectedIds[0] === node.id
   )
-}
-
-export function resolveNodeSelectionTarget(node: AnyNode): NodeSelectionTarget | null {
-  if (node.type === 'building') {
-    return { phase: 'site' }
-  }
-
-  if (node.type === 'zone') {
-    return {
-      phase: 'structure',
-      structureLayer: 'zones',
-    }
-  }
-
-  if (node.type === 'item') {
-    const item = node as ItemNode
-    if (item.asset.category === 'door' || item.asset.category === 'window') {
-      return {
-        phase: 'structure',
-        structureLayer: 'elements',
-      }
-    }
-    return { phase: 'furnish' }
-  }
-
-  if (
-    node.type === 'wall' ||
-    node.type === 'fence' ||
-    node.type === 'column' ||
-    node.type === 'elevator' ||
-    node.type === 'slab' ||
-    node.type === 'ceiling' ||
-    node.type === 'roof' ||
-    node.type === 'roof-segment' ||
-    node.type === 'stair' ||
-    node.type === 'stair-segment' ||
-    node.type === 'spawn' ||
-    node.type === 'window' ||
-    node.type === 'door'
-  ) {
-    return {
-      phase: 'structure',
-      structureLayer: 'elements',
-    }
-  }
-
-  const def = nodeRegistry.get(node.type)
-  if (!def) return null
-
-  if (def.category === 'furnish') {
-    return { phase: 'furnish' }
-  }
-
-  return {
-    phase: 'structure',
-    structureLayer: 'elements',
-  }
 }

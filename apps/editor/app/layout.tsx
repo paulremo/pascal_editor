@@ -1,9 +1,16 @@
+import { registerBundledLocales } from '@pascal-app/editor/locales'
 import { Agentation } from 'agentation'
 import { GeistPixelSquare } from 'geist/font/pixel'
 import { Barlow } from 'next/font/google'
 import localFont from 'next/font/local'
+import { headers } from 'next/headers'
+import { registerDevLocales } from '@/lib/dev-locales'
+import { PASCAL_LOCALE_HEADER, resolveUiLocale } from '@/lib/ui-locale'
 import { ClientBootstrap } from './client-bootstrap'
 import './globals.css'
+
+registerBundledLocales()
+registerDevLocales()
 
 const geistSans = localFont({
   src: './fonts/GeistVF.woff',
@@ -21,24 +28,25 @@ const barlow = Barlow({
   display: 'swap',
 })
 
-export default function RootLayout({
+export default async function RootLayout({
   children,
 }: Readonly<{
   children: React.ReactNode
 }>) {
+  const enableDevDiagnostics =
+    process.env.NODE_ENV === 'development' && process.env.PASCAL_DEV_DIAGNOSTICS === '1'
+  const locale = resolveUiLocale((await headers()).get(PASCAL_LOCALE_HEADER))
+
   return (
     <html
       className={`${geistSans.variable} ${geistMono.variable} ${GeistPixelSquare.variable} ${barlow.variable}`}
-      lang="en"
+      lang={locale}
     >
-      <head>
-        {process.env.NODE_ENV === 'development' && (
-          <script async crossOrigin="anonymous" src="//unpkg.com/react-scan/dist/auto.global.js" />
-        )}
-      </head>
       <body className="font-sans">
-        <ClientBootstrap>{children}</ClientBootstrap>
-        {process.env.NODE_ENV === 'development' && <Agentation />}
+        <ClientBootstrap enableDevDiagnostics={enableDevDiagnostics} locale={locale}>
+          {children}
+        </ClientBootstrap>
+        {enableDevDiagnostics && <Agentation />}
       </body>
     </html>
   )

@@ -1,16 +1,16 @@
 import type { CabinetModuleNode, CabinetNode } from '@pascal-app/core'
+import { CABINET_METRIC_DEFAULTS } from '@pascal-app/core'
 import {
   COOKTOP_STANDARD_WIDTH,
   cooktopCabinetStack,
-  DISHWASHER_STANDARD_HEIGHT,
   DISHWASHER_STANDARD_WIDTH,
+  FRIDGE_COLUMN_HEIGHT,
   FRIDGE_COLUMN_WIDTH,
   fridgeCabinetStack,
   MICROWAVE_STANDARD_WIDTH,
   newCabinetCompartment,
   SINK_STANDARD_WIDTH,
   sinkCabinetStack,
-  TALL_CABINET_CARCASS_HEIGHT,
 } from './stack'
 
 export type CabinetPresetId =
@@ -23,6 +23,10 @@ export type CabinetPresetId =
   | 'tall-pantry'
   | 'oven-tower'
   | 'fridge-single'
+  | 'wall-cabinet'
+
+/** Where a wall cabinet placed on its own hangs: its bottom, above the floor. */
+export const WALL_CABINET_ELEVATION = 1.5
 
 export type CabinetPreset = {
   id: CabinetPresetId
@@ -32,9 +36,9 @@ export type CabinetPreset = {
 
 const baseShared = (run?: CabinetNode): Partial<CabinetModuleNode> => ({
   cabinetType: 'base',
-  depth: run?.depth ?? 0.58,
-  carcassHeight: run?.carcassHeight ?? 0.72,
-  plinthHeight: run?.plinthHeight ?? 0.1,
+  depth: run?.depth ?? CABINET_METRIC_DEFAULTS.depth,
+  carcassHeight: run?.carcassHeight ?? CABINET_METRIC_DEFAULTS.carcassHeight,
+  plinthHeight: run?.plinthHeight ?? CABINET_METRIC_DEFAULTS.plinthHeight,
   toeKickDepth: run?.toeKickDepth ?? 0.075,
   countertopThickness: 0,
   countertopOverhang: run?.countertopOverhang ?? 0.02,
@@ -42,19 +46,37 @@ const baseShared = (run?: CabinetNode): Partial<CabinetModuleNode> => ({
   withCountertop: false,
 })
 
-const runDepth = (run?: CabinetNode) => run?.depth ?? 0.58
+const runDepth = (run?: CabinetNode) => run?.depth ?? CABINET_METRIC_DEFAULTS.depth
+const runCarcassHeight = (run?: CabinetNode) =>
+  run?.carcassHeight ?? CABINET_METRIC_DEFAULTS.carcassHeight
 
 export const CABINET_PRESETS: CabinetPreset[] = [
   {
+    id: 'wall-cabinet',
+    label: 'Wall cabinet',
+    createPatch: () => ({
+      cabinetType: 'base',
+      name: 'Wall Cabinet',
+      width: 0.6,
+      depth: 0.35,
+      carcassHeight: 0.762,
+      showPlinth: false,
+      plinthHeight: 0,
+      withCountertop: false,
+      countertopThickness: 0,
+      stack: [{ ...newCabinetCompartment('door'), doorType: 'double', shelfCount: 2 }],
+    }),
+  },
+  {
     id: 'base-door',
-    label: 'Base',
+    label: 'Base cabinet',
     createPatch: (run) => ({
       ...baseShared(run),
       name: 'Base Cabinet',
-      width: 0.6,
+      width: 0.5,
       handleStyle: 'bar',
       handlePosition: 'auto',
-      frontOverlay: 'inset',
+      frontOverlay: 'full',
       stack: [
         { ...newCabinetCompartment('drawer'), height: 0.44, drawerCount: 3 },
         { ...newCabinetCompartment('door'), doorType: 'double', shelfCount: 2 },
@@ -63,11 +85,11 @@ export const CABINET_PRESETS: CabinetPreset[] = [
   },
   {
     id: 'drawer-base',
-    label: 'Drawer Base',
+    label: 'Drawer cabinet',
     createPatch: (run) => ({
       ...baseShared(run),
       name: 'Drawer Base',
-      width: 0.6,
+      width: 0.5,
       handleStyle: 'bar',
       handlePosition: 'top',
       frontOverlay: 'full',
@@ -81,16 +103,15 @@ export const CABINET_PRESETS: CabinetPreset[] = [
       ...baseShared(run),
       name: 'Dishwasher',
       width: DISHWASHER_STANDARD_WIDTH,
-      carcassHeight: DISHWASHER_STANDARD_HEIGHT,
       handleStyle: 'bar',
       handlePosition: 'top',
       frontOverlay: 'full',
-      stack: [{ ...newCabinetCompartment('dishwasher'), height: DISHWASHER_STANDARD_HEIGHT }],
+      stack: [{ ...newCabinetCompartment('dishwasher'), height: runCarcassHeight(run) }],
     }),
   },
   {
     id: 'cooktop-gas',
-    label: 'Gas Hob',
+    label: 'Gas cooktop',
     createPatch: (run) => ({
       ...baseShared(run),
       name: 'Gas Hob Base',
@@ -103,7 +124,7 @@ export const CABINET_PRESETS: CabinetPreset[] = [
   },
   {
     id: 'cooktop-induction',
-    label: 'Induction',
+    label: 'Induction cooktop',
     createPatch: (run) => ({
       ...baseShared(run),
       name: 'Induction Base',
@@ -116,7 +137,7 @@ export const CABINET_PRESETS: CabinetPreset[] = [
   },
   {
     id: 'sink-base',
-    label: 'Sink',
+    label: 'Sink cabinet',
     createPatch: (run) => ({
       ...baseShared(run),
       name: 'Sink Base',
@@ -133,10 +154,10 @@ export const CABINET_PRESETS: CabinetPreset[] = [
     createPatch: (run) => ({
       cabinetType: 'tall',
       name: 'Tall Pantry',
-      width: 0.6,
-      depth: run?.depth ?? 0.58,
+      width: 0.5,
+      depth: run?.depth ?? CABINET_METRIC_DEFAULTS.depth,
       carcassHeight: 2.07,
-      plinthHeight: 0.1,
+      plinthHeight: CABINET_METRIC_DEFAULTS.plinthHeight,
       toeKickDepth: 0.075,
       countertopThickness: 0,
       countertopOverhang: run?.countertopOverhang ?? 0.02,
@@ -155,9 +176,9 @@ export const CABINET_PRESETS: CabinetPreset[] = [
       cabinetType: 'tall',
       name: 'Oven Tower',
       width: MICROWAVE_STANDARD_WIDTH,
-      depth: run?.depth ?? 0.58,
+      depth: run?.depth ?? CABINET_METRIC_DEFAULTS.depth,
       carcassHeight: 2.07,
-      plinthHeight: 0.1,
+      plinthHeight: CABINET_METRIC_DEFAULTS.plinthHeight,
       toeKickDepth: 0.075,
       countertopThickness: 0,
       countertopOverhang: run?.countertopOverhang ?? 0.02,
@@ -176,14 +197,14 @@ export const CABINET_PRESETS: CabinetPreset[] = [
   },
   {
     id: 'fridge-single',
-    label: 'Single Fridge',
+    label: 'Fridge',
     createPatch: (run) => ({
       cabinetType: 'tall',
       name: 'Single Door Refrigerator',
       width: FRIDGE_COLUMN_WIDTH,
       depth: runDepth(run),
-      carcassHeight: TALL_CABINET_CARCASS_HEIGHT,
-      plinthHeight: 0.1,
+      carcassHeight: FRIDGE_COLUMN_HEIGHT,
+      plinthHeight: CABINET_METRIC_DEFAULTS.plinthHeight,
       toeKickDepth: 0.075,
       countertopThickness: 0,
       countertopOverhang: run?.countertopOverhang ?? 0.02,
@@ -198,5 +219,8 @@ export const CABINET_PRESETS: CabinetPreset[] = [
 ]
 
 export function cabinetPresetById(id: CabinetPresetId): CabinetPreset {
-  return CABINET_PRESETS.find((preset) => preset.id === id) ?? CABINET_PRESETS[0]!
+  return (
+    CABINET_PRESETS.find((preset) => preset.id === id) ??
+    CABINET_PRESETS.find((preset) => preset.id === 'base-door')!
+  )
 }

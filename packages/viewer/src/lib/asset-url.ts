@@ -1,6 +1,6 @@
-import { loadAssetUrl } from '@pascal-app/core'
+import { loadAssetUrl, resolveArtifactUrl } from '@pascal-app/core'
 
-export const ASSETS_CDN_URL = process.env.NEXT_PUBLIC_ASSETS_CDN_URL || 'https://editor.pascal.app'
+import { getViewerConfig } from './viewer-config'
 
 /**
  * Resolves an asset URL to the appropriate format:
@@ -11,6 +11,8 @@ export const ASSETS_CDN_URL = process.env.NEXT_PUBLIC_ASSETS_CDN_URL || 'https:/
  */
 export async function resolveAssetUrl(url: string | undefined | null): Promise<string | null> {
   if (!url) return null
+
+  if (url.startsWith('artifact://')) return resolveArtifactUrl(url)
 
   // External URL - use as-is
   if (url.startsWith('http://') || url.startsWith('https://')) {
@@ -24,7 +26,7 @@ export async function resolveAssetUrl(url: string | undefined | null): Promise<s
 
   // Absolute or relative path - prepend CDN URL
   const normalizedPath = url.startsWith('/') ? url : `/${url}`
-  return `${ASSETS_CDN_URL}${normalizedPath}`
+  return `${getViewerConfig().assetsBaseUrl.replace(/\/$/, '')}${normalizedPath}`
 }
 
 /**
@@ -33,6 +35,9 @@ export async function resolveAssetUrl(url: string | undefined | null): Promise<s
  */
 export function resolveCdnUrl(url: string | undefined | null): string | null {
   if (!url) return null
+
+  if (url.startsWith('artifact://')) return resolveArtifactUrl(url)
+  if (url.startsWith('blob:')) return url
 
   // External URL - use as-is
   if (url.startsWith('http://') || url.startsWith('https://')) {
@@ -47,5 +52,5 @@ export function resolveCdnUrl(url: string | undefined | null): string | null {
 
   // Absolute or relative path - prepend CDN URL
   const normalizedPath = url.startsWith('/') ? url : `/${url}`
-  return `${ASSETS_CDN_URL}${normalizedPath}`
+  return `${getViewerConfig().assetsBaseUrl.replace(/\/$/, '')}${normalizedPath}`
 }

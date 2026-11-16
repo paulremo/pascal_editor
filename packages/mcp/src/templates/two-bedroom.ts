@@ -1,3 +1,4 @@
+import { NEW_DOOR_FRAME_THICKNESS } from '@pascal-app/core/building'
 import type { SceneGraph } from '@pascal-app/core/clone-scene-graph'
 import type { AnyNode, AnyNodeId } from '@pascal-app/core/schema'
 
@@ -45,7 +46,6 @@ function wall(
     metadata: {},
     children,
     thickness: WALL_THICKNESS,
-    height: WALL_HEIGHT,
     start,
     end,
     frontSide: 'unknown',
@@ -66,8 +66,7 @@ function door(id: string, parentWallId: string): AnyNode {
     rotation: [0, 0, 0],
     width: 0.8,
     height: 2.1,
-    frameThickness: 0.05,
-    frameDepth: 0.07,
+    frameThickness: NEW_DOOR_FRAME_THICKNESS,
     threshold: true,
     thresholdHeight: 0.02,
     hingesSide: 'left',
@@ -114,7 +113,6 @@ function makeWindow(id: string, parentWallId: string, width = 1.2): AnyNode {
     width,
     height: 1.2,
     frameThickness: 0.05,
-    frameDepth: 0.07,
     columnRatios: [1],
     rowRatios: [1],
     columnDividerThickness: 0.03,
@@ -274,6 +272,7 @@ function buildTemplate(): SceneGraph {
     visible: true,
     metadata: {},
     level: 0,
+    height: WALL_HEIGHT,
     children: [
       'wall_n',
       'wall_e',

@@ -1,6 +1,6 @@
 'use client'
 
-import type { AssetInput } from '@pascal-app/core'
+import { type AssetInput, type MessageDescriptor, usePascalI18n } from '@pascal-app/core'
 import { Root as TooltipRoot } from '@radix-ui/react-tooltip'
 import NextImage from 'next/image'
 import { useMemo, useState } from 'react'
@@ -11,7 +11,7 @@ import {
   TooltipContent,
   TooltipProvider,
   TooltipTrigger,
-} from '../../../../../components/ui/primitives/tooltip'
+} from '@pascal-app/viewer/ui'
 
 /** A function-axis taxonomy node, assembled into a tree by the embedder. */
 export type FunctionTreeNode = {
@@ -21,10 +21,10 @@ export type FunctionTreeNode = {
   children: FunctionTreeNode[]
 }
 
-const SOURCE_CHIPS: Array<{ id: NonNullable<AssetInput['source']>; label: string }> = [
-  { id: 'library', label: 'Library' },
-  { id: 'community', label: 'Community' },
-  { id: 'mine', label: 'Mine' },
+const SOURCE_CHIPS: Array<{ id: NonNullable<AssetInput['source']>; label: MessageDescriptor }> = [
+  { id: 'library', label: /* i18n */ { id: 'editor.sidebar.panels.itemsPanel.functionTreePanel.library', message: 'Library' } },
+  { id: 'community', label: /* i18n */ { id: 'editor.sidebar.panels.itemsPanel.functionTreePanel.community', message: 'Community' } },
+  { id: 'mine', label: /* i18n */ { id: 'editor.sidebar.panels.itemsPanel.functionTreePanel.mine', message: 'Mine' } },
 ]
 
 /** Every slug at or below `node`, so a non-leaf selection matches descendants. */
@@ -64,6 +64,7 @@ export function FunctionTreePanel({
   leadingTile?: React.ReactNode
   emptyState?: React.ReactNode
 }) {
+  const i18n = usePascalI18n()
   const [activeRootSlug, setActiveRootSlug] = useState<string | null>(
     functionTree[0]?.slug ?? null,
   )
@@ -118,9 +119,14 @@ export function FunctionTreePanel({
     <div className="flex h-full flex-col">
       {/* Root nodes as a category grid — icon when available, otherwise a
           two-letter abbreviation, with the full name in a hover tooltip.
-          Mirrors the Build tab's tile grid so the two panels read the same. */}
+          Mirrors the Build tab's tile grid so the two panels read the same.
+
+          `functionTree` is embedder-supplied and unbounded, and these tiles are
+          `aspect-square`, so row count grows with it while the item list below is
+          the only scroller. Without the cap a large taxonomy pushes the list out
+          of the panel entirely and nothing can scroll it back. */}
       <TooltipProvider delayDuration={0} disableHoverableContent>
-        <div className="grid shrink-0 grid-cols-5 gap-1.5 border-border/70 border-b p-2">
+        <div className="grid max-h-[40%] shrink-0 grid-cols-5 gap-1.5 overflow-y-auto border-border/70 border-b p-2">
           {functionTree.map((root) => {
             const isActive = activeRoot?.slug === root.slug
             return (
@@ -131,7 +137,7 @@ export function FunctionTreePanel({
                       'relative flex aspect-square items-center justify-center rounded-xl transition-all duration-200',
                       isActive
                         ? 'bg-primary/10 ring-1 ring-primary/50'
-                        : 'bg-muted/40 opacity-70 grayscale hover:bg-muted hover:opacity-100 hover:grayscale-0',
+                        : 'bg-black/4 opacity-70 grayscale hover:bg-black/8 hover:opacity-100 hover:grayscale-0 dark:bg-muted/40 dark:hover:bg-muted',
                     )}
                     onClick={() => {
                       triggerSFX('sfx:menu-click')
@@ -173,7 +179,7 @@ export function FunctionTreePanel({
               setSearch(e.target.value)
               onSearchChange?.(e.target.value)
             }}
-            placeholder="Search..."
+            placeholder={i18n._({ id: 'editor.sidebar.panels.itemsPanel.functionTreePanel.search', message: 'Search...' })}
             type="text"
             value={search}
           />
@@ -192,7 +198,7 @@ export function FunctionTreePanel({
                   onClick={() => setActiveSource(isActive ? null : chip.id)}
                   type="button"
                 >
-                  {chip.label}
+                  {i18n._(chip.label)}
                 </button>
               )
             })}
@@ -212,7 +218,7 @@ export function FunctionTreePanel({
               onClick={() => setActiveChildSlug(null)}
               type="button"
             >
-              All
+              {i18n._({ id: 'editor.sidebar.panels.itemsPanel.functionTreePanel.all', message: 'All' })}
             </button>
             {activeRoot.children.map((child) => {
               const isActive = activeChildSlug === child.slug
@@ -245,8 +251,7 @@ export function FunctionTreePanel({
         ) : isServerSearch && search && searchResults?.length === 0 ? (
           (emptyState ?? (
             <div className="flex h-full items-center justify-center text-muted-foreground text-xs">
-              No results for &ldquo;{search}&rdquo;
-            </div>
+              {i18n._({ id: 'editor.sidebar.panels.itemsPanel.functionTreePanel.noResultsForSearch', message: 'No results for “{search}”', values: { search } })}</div>
           ))
         ) : (
           <ItemCatalog

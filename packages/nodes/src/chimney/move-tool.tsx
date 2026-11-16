@@ -12,6 +12,9 @@ import {
 } from '@pascal-app/core'
 import {
   consumePlacementDragRelease,
+  copyCollectionIds,
+  isGridSnapActive,
+  isMagneticSnapActive,
   markToolCancelConsumed,
   triggerSFX,
   useEditor,
@@ -127,9 +130,9 @@ const MoveChimneyTool = ({ node }: { node: ChimneyNode }) => {
       const rawTarget = roofDrag.resolve(event)
       if (!rawTarget) return null
       return snapRoofSurfaceNodeTarget({
-        target: snapRelativeRoofDragTarget(rawTarget, event.nativeEvent?.shiftKey === true),
+        target: snapRelativeRoofDragTarget(rawTarget, event.nativeEvent?.altKey === true),
         node,
-        bypass: event.nativeEvent?.shiftKey === true,
+        bypass: !isMagneticSnapActive() || event.nativeEvent?.altKey === true,
       })
     }
 
@@ -148,7 +151,11 @@ const MoveChimneyTool = ({ node }: { node: ChimneyNode }) => {
       const sx = Math.round(target.localX * 20) / 20
       const sz = Math.round(target.localZ * 20) / 20
       const prev = lastSnapRef.current
-      if (event.nativeEvent?.shiftKey !== true && (!prev || prev[0] !== sx || prev[1] !== sz)) {
+      if (
+        isGridSnapActive() &&
+        event.nativeEvent?.altKey !== true &&
+        (!prev || prev[0] !== sx || prev[1] !== sz)
+      ) {
         triggerSFX('sfx:grid-snap')
         lastSnapRef.current = [sx, sz]
       }
@@ -198,7 +205,13 @@ const MoveChimneyTool = ({ node }: { node: ChimneyNode }) => {
         useScene.temporal.getState().resume()
         state.applyNodeChanges({
           delete: node.id ? [node.id as AnyNodeId] : [],
-          create: [{ node: committed, parentId: targetSegmentId }],
+          create: [
+            {
+              node: committed,
+              parentId: targetSegmentId,
+              collectionIds: copyCollectionIds(node),
+            },
+          ],
         })
         state.dirtyNodes.add(targetSegmentId)
         setSelection({ selectedIds: [committed.id] })

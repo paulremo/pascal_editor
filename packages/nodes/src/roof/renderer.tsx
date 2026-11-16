@@ -3,13 +3,24 @@
 import {
   type AnyNodeId,
   hasSegmentMaterialOverride,
+  isIndependentRoofSegment,
   type RoofNode,
-  type RoofSegmentNode,
+  roofFaceOf,
   useLiveNodeOverrides,
   useRegistry,
+  useRegistryVersion,
   useScene,
 } from '@pascal-app/core'
-import { getRoofMaterialArray, NodeRenderer, useNodeEvents, useViewer } from '@pascal-app/viewer'
+import {
+  getRoofMaterialArray,
+  isRevealAssembling,
+  levelWallCladdingRef,
+  levelWallFaceRef,
+  NodeRenderer,
+  subscribeRevealAssembling,
+  useNodeEvents,
+  useViewer,
+} from '@pascal-app/viewer'
 import { useEffect, useLayoutEffect, useMemo, useRef } from 'react'
 import type * as THREE from 'three'
 import { useShallow } from 'zustand/react/shallow'
@@ -29,6 +40,31 @@ export const RoofRenderer = ({ node: rawNode }: { node: RoofNode }) => {
     useScene.getState().markDirty(node.id)
   }, [node.id])
 
+  // A roof an agent builds assembles: its segments drop in drawn apart, then
+  // the merged shell (built meanwhile) takes over. Imperative and synchronous,
+  // so a capture that ends the reveal sees the whole shell in the same tick.
+  useLayoutEffect(() => {
+    const group = ref.current
+    const show = (assembling: boolean) => {
+      const merged = group.getObjectByName('merged-roof')
+      const wrapper = group.getObjectByName('segments-wrapper')
+      const elements = group.getObjectByName('roof-elements')
+      if (merged) merged.visible = !assembling
+      if (wrapper) wrapper.visible = assembling
+      if (elements) elements.visible = !assembling
+      if (assembling || !wrapper) return
+      // Hidden meshes still meet rays: back to empty placeholders, as after a reload.
+      for (const child of wrapper.children) {
+        const mesh = child as THREE.Mesh
+        if (!mesh.isMesh || mesh.geometry?.userData.placeholder) continue
+        mesh.geometry?.dispose()
+        mesh.geometry = createPlaceholderGeometry(4)
+      }
+    }
+    if (isRevealAssembling(node.id)) show(true)
+    return subscribeRevealAssembling(node.id, show)
+  }, [node.id])
+
   const handlers = useNodeEvents(node, 'roof')
   const debugColors = useViewer((s) => s.debugColors)
   const shading = useViewer((s) => s.shading)
@@ -43,12 +79,25 @@ export const RoofRenderer = ({ node: rawNode }: { node: RoofNode }) => {
     useShallow((state) => {
       const ids: AnyNodeId[] = []
       for (const segmentId of node.children ?? []) {
-        const seg = state.nodes[segmentId as AnyNodeId] as RoofSegmentNode | undefined
-        if (!seg) continue
+        const seg = state.nodes[segmentId as AnyNodeId]
+        if (seg?.type !== 'roof-segment') continue
         for (const childId of seg.children ?? []) ids.push(childId as AnyNodeId)
       }
       return ids
     }),
+  )
+
+  // Faces of other kinds (`capabilities.roofs`: a plugin's roof planes) render as their own kind,
+  // in the roof's frame, beside the shell its segments merge into. A plugin registers its kinds
+  // after the first mount: the version re-reads them.
+  useRegistryVersion()
+  const faceIds = useScene(
+    useShallow(
+      (state) =>
+        (node.children ?? []).filter((childId) =>
+          roofFaceOf(state.nodes[childId as AnyNodeId]),
+        ) as AnyNodeId[],
+    ),
   )
 
   // Segments that carry their own material/preset are rendered outside the
@@ -62,9 +111,10 @@ export const RoofRenderer = ({ node: rawNode }: { node: RoofNode }) => {
     useShallow((state) => {
       const ids: AnyNodeId[] = []
       for (const segmentId of node.children ?? []) {
-        const seg = state.nodes[segmentId as AnyNodeId] as RoofSegmentNode | undefined
-        if (!seg) continue
-        if (hasSegmentMaterialOverride(seg)) ids.push(segmentId as AnyNodeId)
+        const seg = state.nodes[segmentId as AnyNodeId]
+        if (seg?.type !== 'roof-segment') continue
+        if (hasSegmentMaterialOverride(seg) || isIndependentRoofSegment(seg))
+          ids.push(segmentId as AnyNodeId)
       }
       return ids
     }),
@@ -73,9 +123,10 @@ export const RoofRenderer = ({ node: rawNode }: { node: RoofNode }) => {
     useShallow((state) => {
       const ids: AnyNodeId[] = []
       for (const segmentId of node.children ?? []) {
-        const seg = state.nodes[segmentId as AnyNodeId] as RoofSegmentNode | undefined
-        if (!seg) continue
-        if (!hasSegmentMaterialOverride(seg)) ids.push(segmentId as AnyNodeId)
+        const seg = state.nodes[segmentId as AnyNodeId]
+        if (seg?.type !== 'roof-segment') continue
+        if (!hasSegmentMaterialOverride(seg) && !isIndependentRoofSegment(seg))
+          ids.push(segmentId as AnyNodeId)
       }
       return ids
     }),
@@ -84,15 +135,38 @@ export const RoofRenderer = ({ node: rawNode }: { node: RoofNode }) => {
   // 4 groups map 1:1 to the roof's 4-material array (see getRoofMaterialArray).
   const placeholderGeometry = useMemo(() => createPlaceholderGeometry(4), [])
 
+  // The gable band is clad like the walls below it (their assemblies).
+  const wallCladdingRef = useScene((state) => levelWallCladdingRef(state.nodes, node))
+  // The heel band, under the eaves, is wall: it shows what the walls below show outside.
+  const wallFaceRef = useScene((state) => levelWallFaceRef(state.nodes, node))
+  const sceneMaterials = useScene((state) => state.materials)
   const customMaterial = useMemo(
-    () => getRoofMaterialArray(node, shading, textures, colorPreset, sceneTheme),
-    [node, shading, textures, colorPreset, sceneTheme],
+    () =>
+      getRoofMaterialArray(
+        node,
+        shading,
+        textures,
+        colorPreset,
+        sceneTheme,
+        wallCladdingRef,
+        sceneMaterials,
+        wallFaceRef,
+      ),
+    [
+      node,
+      shading,
+      textures,
+      colorPreset,
+      sceneTheme,
+      wallCladdingRef,
+      sceneMaterials,
+      wallFaceRef,
+    ],
   )
 
   const material = debugColors
     ? getRoofDebugMaterials(shading)
     : customMaterial || getRoofMaterials(shading, textures, colorPreset)
-
   useEffect(() => {
     return () => {
       placeholderGeometry.dispose()
@@ -126,6 +200,11 @@ export const RoofRenderer = ({ node: rawNode }: { node: RoofNode }) => {
       </group>
       <group name="roof-elements">
         {roofElementIds.map((childId) => (
+          <NodeRenderer key={childId} nodeId={childId} />
+        ))}
+      </group>
+      <group name="roof-faces">
+        {faceIds.map((childId) => (
           <NodeRenderer key={childId} nodeId={childId} />
         ))}
       </group>

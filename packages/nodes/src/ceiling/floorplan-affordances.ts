@@ -2,14 +2,15 @@ import { type AnyNode, type CeilingNode, resolveLevelId } from '@pascal-app/core
 import { resolveCeilingPlanPointSnap } from '@pascal-app/editor'
 import {
   createPolygonAddVertexAffordance,
+  createPolygonDeleteVertexAffordance,
   createPolygonMoveEdgeAffordance,
   createPolygonVertexAffordance,
   type PolygonAffordanceSnapContext,
 } from '../shared/polygon-vertex-affordance'
 
 /**
- * 2D drag affordances for ceiling. Same three operations as slab
- * (`move-vertex`, `add-vertex`, `move-edge`), each accepting an
+ * 2D affordances for ceiling. Same four operations as slab
+ * (`move-vertex`, `add-vertex`, `move-edge`, `delete-vertex`), each accepting an
  * optional `holeIndex`. See `slab/floorplan-affordances.ts` for the
  * full contract.
  */
@@ -42,6 +43,10 @@ export const ceilingAddVertexAffordance = createPolygonAddVertexAffordance<Ceili
   ceilingSnapOptions,
 )
 export const ceilingMoveEdgeAffordance = createPolygonMoveEdgeAffordance<CeilingNode>(
+  'ceiling',
+  ceilingSnapOptions,
+)
+export const ceilingDeleteVertexAffordance = createPolygonDeleteVertexAffordance<CeilingNode>(
   'ceiling',
   ceilingSnapOptions,
 )

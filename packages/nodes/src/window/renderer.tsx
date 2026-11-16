@@ -10,6 +10,7 @@ import {
 import { useLayoutEffect, useMemo, useRef } from 'react'
 import type { Mesh } from 'three'
 import { RoofFaceHostFrame } from '../shared/roof-face-host'
+import { ScriptedOpeningModel } from '../shared/scripted-opening'
 
 export const WindowRenderer = ({ node }: { node: WindowNode }) => {
   const ref = useRef<Mesh>(null!)
@@ -20,10 +21,8 @@ export const WindowRenderer = ({ node }: { node: WindowNode }) => {
   }, [node.id])
   const handlers = useNodeEvents(node, 'window')
   const shading = useViewer((s) => s.shading)
-  const liveVisible = useLiveNodeOverrides((s) => {
-    const visible = s.get(node.id)?.visible
-    return typeof visible === 'boolean' ? visible : undefined
-  })
+  const liveOverrides = useLiveNodeOverrides((s) => s.get(node.id))
+  const renderNode = liveOverrides ? ({ ...node, ...liveOverrides } as WindowNode) : node
   const isTransient = !!(node.metadata as Record<string, unknown> | null)?.isTransient
 
   const material = useMemo(() => {
@@ -41,19 +40,20 @@ export const WindowRenderer = ({ node }: { node: WindowNode }) => {
   const mesh = (
     <mesh
       material={material}
-      position={node.position}
+      position={renderNode.position}
       ref={ref}
-      rotation={node.rotation}
-      visible={liveVisible ?? node.visible}
+      rotation={renderNode.rotation}
+      visible={renderNode.visible}
       {...(isTransient ? {} : handlers)}
     >
       <boxGeometry args={[0, 0, 0]} />
+      {renderNode.source && <ScriptedOpeningModel node={renderNode} />}
     </mesh>
   )
 
-  if (!node.roofSegmentId) return mesh
+  if (!renderNode.roofSegmentId) return mesh
   return (
-    <RoofFaceHostFrame roofFace={node.roofFace} roofSegmentId={node.roofSegmentId}>
+    <RoofFaceHostFrame roofFace={renderNode.roofFace} roofSegmentId={renderNode.roofSegmentId}>
       {mesh}
     </RoofFaceHostFrame>
   )

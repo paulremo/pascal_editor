@@ -1,5 +1,6 @@
 import { describe, expect, test } from 'bun:test'
 import { type AnyNode, type AnyNodeId, type SceneApi, WallNode } from '@pascal-app/core'
+import { cabinetDefinition } from '../definition'
 import { cabinetQuickActions } from '../quick-actions'
 import { addCabinetModuleSide, addCornerRun } from '../run-ops'
 import { CabinetModuleNode, CabinetNode } from '../schema'
@@ -42,6 +43,67 @@ function sceneApiFixture(seed: AnyNode[]): SceneApi {
 }
 
 describe('cabinet quick actions', () => {
+  test('does not expose hinge flipping in the floating actions', () => {
+    const run = CabinetNode.parse({
+      id: 'cabinet_run-quick-actions-no-hinge',
+      parentId: 'level_quick-actions-no-hinge',
+      children: ['cabinet-module_quick-actions-no-hinge'],
+    })
+    const module = CabinetModuleNode.parse({
+      id: 'cabinet-module_quick-actions-no-hinge',
+      parentId: run.id,
+      width: 0.4,
+      stack: [{ id: 'door-quick-actions-no-hinge', type: 'door', doorType: 'single-left' }],
+    })
+    const sceneApi = sceneApiFixture([run as AnyNode, module as AnyNode])
+
+    expect(
+      cabinetQuickActions({ node: module, nodes: sceneApi.nodes() }).some(
+        (action) => action.id === 'cabinet:flip-hinge',
+      ),
+    ).toBe(false)
+  })
+
+  test.each(['left', 'right'] as const)(
+    'selects the outer base cabinet after an L %s action',
+    (side) => {
+      const levelId = `level_quick-actions-select-outer-${side}` as AnyNodeId
+      const run = CabinetNode.parse({
+        id: `cabinet_run-quick-actions-select-outer-${side}`,
+        parentId: levelId,
+        position: [0, 0, 0],
+        rotation: 0,
+        children: [`cabinet-module_source-quick-actions-select-outer-${side}`],
+      })
+      const source = CabinetModuleNode.parse({
+        id: `cabinet-module_source-quick-actions-select-outer-${side}`,
+        parentId: run.id,
+        position: [0, 0.1, 0],
+        width: 0.9,
+        depth: 0.58,
+        carcassHeight: 0.72,
+      })
+      const sceneApi = sceneApiFixture([run as AnyNode, source as AnyNode])
+      const action = cabinetQuickActions({ node: source, nodes: sceneApi.nodes() }).find(
+        (candidate) => candidate.id === `cabinet:add-corner-${side}`,
+      )
+
+      expect(action?.disabled).toBeFalsy()
+      const selectedId = action?.run({ sceneApi })?.selectedIds?.[0]
+      const selected = selectedId ? sceneApi.get<CabinetModuleNode>(selectedId) : null
+      const derivedRun = selected?.parentId
+        ? sceneApi.get<CabinetNode>(selected.parentId as AnyNodeId)
+        : null
+      const sourceRun = sceneApi.get<CabinetNode>(run.id as AnyNodeId)
+
+      expect(selected?.name).toBe('Base Cabinet')
+      expect(selected?.moduleKind).toBe('standard')
+      expect(derivedRun?.parentId).toBe(run.id)
+      expect(sourceRun?.children).toContain(derivedRun?.id as AnyNodeId)
+      expect(cabinetDefinition.relations?.hosts).toContain('cabinet')
+    },
+  )
+
   test('offers and runs an L-corner action from run selection using the end module', () => {
     const levelId = 'level_quick_actions_corner' as AnyNodeId
     const run = CabinetNode.parse({
@@ -238,7 +300,7 @@ describe('cabinet quick actions', () => {
     expect(sceneApi.get<CabinetModuleNode>(source.id)?.width).toBeCloseTo(0.59)
   })
 
-  test('disables blocked side and corner actions instead of hiding them', () => {
+  test('pushes a flush neighbor for a side insertion while keeping corner actions disabled', () => {
     const levelId = 'level_quick_actions_disabled-blocked-side' as AnyNodeId
     const run = CabinetNode.parse({
       id: 'cabinet_run-quick-actions-disabled-blocked-side',
@@ -286,15 +348,16 @@ describe('cabinet quick actions', () => {
     const rightAction = actions.find((action) => action.id === 'cabinet:add-right')
     const cornerRightAction = actions.find((action) => action.id === 'cabinet:add-corner-right')
 
-    expect(rightAction?.disabled).toBe(true)
+    expect(rightAction?.disabled).toBe(false)
     expect(cornerRightAction?.disabled).toBe(true)
-    expect(rightAction?.run({ sceneApi })).toBeUndefined()
+    expect(rightAction?.run({ sceneApi })).toBeTruthy()
     expect(cornerRightAction?.run({ sceneApi })).toBeUndefined()
     expect(
       Object.values(sceneApi.nodes()).filter(
         (node): node is CabinetModuleNode => node.type === 'cabinet-module',
       ),
-    ).toHaveLength(moduleCountBefore)
+    ).toHaveLength(moduleCountBefore + 1)
+    expect(sceneApi.get<CabinetModuleNode>(rightModule.id)?.position[0]).toBeCloseTo(0.95)
   })
 
   test('disables wall-blocked side add while keeping shrinkable L action enabled', () => {
@@ -335,6 +398,104 @@ describe('cabinet quick actions', () => {
     expect(cornerRightAction?.disabled).toBeFalsy()
   })
 
+  test('disables wall addition when an expanded wall cabinet occupies the proposed space', () => {
+    const levelId = 'level_quick-actions-wall-overlap' as AnyNodeId
+    const run = CabinetNode.parse({
+      id: 'cabinet_run-quick-actions-wall-overlap',
+      parentId: levelId,
+      children: [
+        'cabinet-module_left-quick-actions-wall-overlap',
+        'cabinet-module_selected-quick-actions-wall-overlap',
+      ],
+    })
+    const leftBase = CabinetModuleNode.parse({
+      id: 'cabinet-module_left-quick-actions-wall-overlap',
+      parentId: run.id,
+      children: ['cabinet-module_expanded-wall-quick-actions-wall-overlap'],
+      position: [-0.25, 0.1, 0],
+    })
+    const selectedBase = CabinetModuleNode.parse({
+      id: 'cabinet-module_selected-quick-actions-wall-overlap',
+      parentId: run.id,
+      position: [0.25, 0.1, 0],
+    })
+    const expandedWall = CabinetModuleNode.parse({
+      id: 'cabinet-module_expanded-wall-quick-actions-wall-overlap',
+      parentId: leftBase.id,
+      name: 'Wall Cabinet',
+      position: [0.15, 1.35, -0.13],
+      width: 0.8,
+      depth: 0.32,
+      carcassHeight: 0.72,
+    })
+    const sceneApi = sceneApiFixture([
+      run as AnyNode,
+      leftBase as AnyNode,
+      selectedBase as AnyNode,
+      expandedWall as AnyNode,
+    ])
+    const wallAction = cabinetQuickActions({
+      node: selectedBase,
+      nodes: sceneApi.nodes(),
+    }).find((action) => action.id === 'cabinet:add-wall')
+    const moduleCount = Object.values(sceneApi.nodes()).filter(
+      (node) => node?.type === 'cabinet-module',
+    ).length
+
+    expect(wallAction?.disabled).toBe(true)
+    expect(wallAction?.blockedFeedback).toBe(true)
+    expect(wallAction?.title).toBe('No space above—overlaps an existing wall cabinet')
+    expect(wallAction?.run({ sceneApi })).toBeUndefined()
+    expect(
+      Object.values(sceneApi.nodes()).filter((node) => node?.type === 'cabinet-module'),
+    ).toHaveLength(moduleCount)
+  })
+
+  test('allows wall addition when an existing wall cabinet only touches the proposed edge', () => {
+    const levelId = 'level_quick-actions-wall-touching' as AnyNodeId
+    const run = CabinetNode.parse({
+      id: 'cabinet_run-quick-actions-wall-touching',
+      parentId: levelId,
+      children: [
+        'cabinet-module_left-quick-actions-wall-touching',
+        'cabinet-module_selected-quick-actions-wall-touching',
+      ],
+    })
+    const leftBase = CabinetModuleNode.parse({
+      id: 'cabinet-module_left-quick-actions-wall-touching',
+      parentId: run.id,
+      children: ['cabinet-module_wall-quick-actions-wall-touching'],
+      position: [-0.25, 0.1, 0],
+    })
+    const selectedBase = CabinetModuleNode.parse({
+      id: 'cabinet-module_selected-quick-actions-wall-touching',
+      parentId: run.id,
+      position: [0.25, 0.1, 0],
+    })
+    const existingWall = CabinetModuleNode.parse({
+      id: 'cabinet-module_wall-quick-actions-wall-touching',
+      parentId: leftBase.id,
+      name: 'Wall Cabinet',
+      position: [0, 1.35, -0.13],
+      depth: 0.32,
+      carcassHeight: 0.72,
+    })
+    const sceneApi = sceneApiFixture([
+      run as AnyNode,
+      leftBase as AnyNode,
+      selectedBase as AnyNode,
+      existingWall as AnyNode,
+    ])
+    const wallAction = cabinetQuickActions({
+      node: selectedBase,
+      nodes: sceneApi.nodes(),
+    }).find((action) => action.id === 'cabinet:add-wall')
+
+    expect(wallAction?.disabled).toBeFalsy()
+    expect(wallAction?.blockedFeedback).toBeUndefined()
+    expect(wallAction?.run({ sceneApi })?.selectedIds).toHaveLength(1)
+  })
+
   test('disables L action when the corner preview has no usable width', () => {
     const levelId = 'level_quick_actions_disabled-corner-wall' as AnyNodeId
     const run = CabinetNode.parse({
@@ -358,8 +519,8 @@ describe('cabinet quick actions', () => {
     const blockingWall = WallNode.parse({
       id: 'wall_quick-actions-disabled-corner-wall',
       parentId: levelId,
-      start: [-1, 0.65],
-      end: [2, 0.65],
+      start: [-1, 0.55],
+      end: [2, 0.55],
       thickness: 0.2,
     })
     const sceneApi = sceneApiFixture([run as AnyNode, source as AnyNode, blockingWall as AnyNode])

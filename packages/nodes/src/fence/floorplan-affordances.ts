@@ -4,16 +4,17 @@ import {
   type FenceNode,
   type FloorplanAffordance,
   type FloorplanAffordanceSession,
+  getFenceCenterlineFrameAt,
   getMaxWallCurveOffset,
   getWallChordFrame,
   normalizeWallCurveOffset,
+  resolveFenceSupportSlabPatch,
   useLiveNodeOverrides,
   useScene,
   type WallNode,
 } from '@pascal-app/core'
 import {
   alignFloorplanDraftPoint,
-  type FencePlanPoint,
   getSegmentGridStep,
   isAlignmentGuideActive,
   isAngleSnapActive,
@@ -21,10 +22,10 @@ import {
   isMagneticSnapActive,
   isSegmentLongEnough,
   snapBuildingLocalToWorldGrid,
-  snapFenceDraftPoint,
   snapScalarToGrid,
   useAlignmentGuides,
 } from '@pascal-app/editor'
+import { type FencePlanPoint, snapFenceDraftPoint } from './drafting'
 
 /**
  * Floor-plan 2D drag affordances for fence — sister to the 3D
@@ -47,11 +48,12 @@ const LINKED_FENCE_ENDPOINT_EPSILON = 0.025
 type FenceEndpointPayload = { fenceId: AnyNodeId; endpoint: 'start' | 'end' }
 type FenceControlPointPayload = { fenceId: AnyNodeId; index: number }
 type FenceTangentPayload = { fenceId: AnyNodeId; index: number; side: 'in' | 'out' }
-
+type FenceThicknessPayload = { fenceId: AnyNodeId; side: 1 | -1 }
 // Must match the floorplan builder's TANGENT_HANDLE_ARM_SCALE: the on-screen
 // arm is this many times the raw tangent vector, so dividing the dragged
 // offset back out recovers the stored tangent.
 const TANGENT_HANDLE_ARM_SCALE = 3
+const MIN_FENCE_THICKNESS = 0.03
 
 function pointsNearlyEqual(a: FencePlanPoint, b: FencePlanPoint): boolean {
   return (
@@ -138,6 +140,40 @@ export const fenceCurveAffordance: FloorplanAffordance<FenceNode> = {
       },
       commit() {
         useScene.getState().updateNodes([{ id: fenceId, data: { curveOffset: lastCurveOffset } }])
+        useLiveNodeOverrides.getState().clear(fenceId)
+      },
+    }
+  },
+}
+
+export const fenceThicknessAffordance: FloorplanAffordance<FenceNode> = {
+  start({ node, payload, initialPlanPoint }): FloorplanAffordanceSession {
+    const { side } = payload as FenceThicknessPayload
+    const frame = getFenceCenterlineFrameAt(node, 0.5)
+    const outwardX = frame.normal.x * side
+    const outwardY = frame.normal.y * side
+    const initialThickness = node.thickness ?? 0.08
+    const fenceId = node.id as AnyNodeId
+    let lastThickness = initialThickness
+
+    return {
+      affectedIds: [fenceId],
+      apply({ planPoint }) {
+        const outwardDelta =
+          (planPoint[0] - initialPlanPoint[0]) * outwardX +
+          (planPoint[1] - initialPlanPoint[1]) * outwardY
+        lastThickness = Math.max(
+          MIN_FENCE_THICKNESS,
+          snapScalarToGrid(initialThickness + outwardDelta * 2, getSegmentGridStep()),
+        )
+        useLiveNodeOverrides.getState().set(fenceId, { thickness: lastThickness })
+        useScene.getState().markDirty(fenceId)
+      },
+      canCommit() {
+        return true
+      },
+      commit() {
+        useScene.getState().updateNodes([{ id: fenceId, data: { thickness: lastThickness } }])
         useLiveNodeOverrides.getState().clear(fenceId)
       },
     }
@@ -265,6 +301,9 @@ export const fenceMoveEndpointAffordance: FloorplanAffordance<FenceNode> = {
     const linkedOriginals = collectLinkedFences(fences, node.id, originalMovingPoint)
 
     const affectedIds: AnyNodeId[] = [node.id, ...linkedOriginals.map((l) => l.id)]
+    let lastPatches = new Map<AnyNodeId, Partial<FenceNode>>()
+    let lastStart = originalStart
+    let lastEnd = originalEnd
 
     return {
       affectedIds,
@@ -288,7 +327,8 @@ export const fenceMoveEndpointAffordance: FloorplanAffordance<FenceNode> = {
           start: angleLocked ? fixedPoint : undefined,
           angleSnap: angleLocked,
           magnetic: isMagneticSnapActive(),
-          gridSnap: (p) => snapBuildingLocalToWorldGrid(p, getSegmentGridStep()) as FencePlanPoint,
+          gridSnap: (p: FencePlanPoint) =>
+            snapBuildingLocalToWorldGrid(p, getSegmentGridStep()) as FencePlanPoint,
         })
         // Figma-style alignment on the dragged endpoint — snaps it onto
         // another object's edge / wall face and publishes a guide, matching
@@ -313,24 +353,63 @@ export const fenceMoveEndpointAffordance: FloorplanAffordance<FenceNode> = {
               end: pointsNearlyEqual(l.end, originalMovingPoint) ? aligned : l.end,
             }))
 
-        useScene.getState().updateNodes([
-          { id: node.id, data: { start: nextStart, end: nextEnd } },
-          ...linkedUpdates.map((u) => ({
-            id: u.id,
-            data: { start: u.start, end: u.end },
-          })),
+        lastStart = nextStart
+        lastEnd = nextEnd
+        const nextPatches = new Map<AnyNodeId, Partial<FenceNode>>([
+          [node.id, { start: nextStart, end: nextEnd }],
+          ...linkedUpdates.map(
+            (update) =>
+              [update.id, { start: update.start, end: update.end }] as [
+                AnyNodeId,
+                Partial<FenceNode>,
+              ],
+          ),
         ])
+        // Re-elect the slab lift host as the endpoint drags (uncapped max
+        // election — 2D has no camera ray). Fences run no per-frame
+        // election: `supportSlabId` IS the lift.
+        const patchedNodes = { ...sceneNodes }
+        for (const [id, patch] of nextPatches) {
+          patchedNodes[id] = { ...patchedNodes[id], ...patch } as AnyNode
+        }
+        for (const id of nextPatches.keys()) {
+          const fence = patchedNodes[id]
+          if (fence?.type !== 'fence') continue
+          const patch = resolveFenceSupportSlabPatch(fence as FenceNode, patchedNodes)
+          if (patch.supportSlabId !== (fence as FenceNode).supportSlabId) {
+            nextPatches.set(id, { ...nextPatches.get(id), ...patch })
+          }
+        }
+
+        const overrides = useLiveNodeOverrides.getState()
+        const scene = useScene.getState()
+        for (const linked of linkedOriginals) {
+          if (!nextPatches.has(linked.id)) {
+            overrides.clear(linked.id)
+            scene.markDirty(linked.id)
+          }
+        }
+        for (const [id, patch] of nextPatches) {
+          overrides.set(id, patch)
+          scene.markDirty(id)
+        }
+        lastPatches = nextPatches
       },
       canCommit() {
         // Pointer-up always runs canCommit — drop the alignment guide here
         // so it doesn't linger after a commit / reject.
         useAlignmentGuides.getState().clear()
-        const finalFence = useScene.getState().nodes[node.id] as FenceNode | undefined
-        return (
-          !!finalFence &&
-          finalFence.type === 'fence' &&
-          isSegmentLongEnough(finalFence.start, finalFence.end)
+        return isSegmentLongEnough(lastStart, lastEnd)
+      },
+      commit() {
+        useScene.getState().updateNodes(
+          Array.from(lastPatches, ([id, data]) => ({
+            id,
+            data,
+          })),
         )
+        const overrides = useLiveNodeOverrides.getState()
+        for (const id of affectedIds) overrides.clear(id)
       },
     }
   },

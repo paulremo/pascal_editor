@@ -2,7 +2,9 @@ import {
   type FloorplanGeometry,
   type FloorplanPoint,
   type GeometryContext,
+  getConicalRoofCoverage,
   getDutchRoofMetrics,
+  getRoofSegmentVisibleTopBounds,
   type RoofNode,
   type RoofSegmentNode,
 } from '@pascal-app/core'
@@ -52,6 +54,8 @@ export function buildRoofSegmentFloorplan(
     cx + lx * cos - lz * sin,
     cz + lx * sin + lz * cos,
   ]
+  const conicalFootprint = getConicalRoofPlanFootprint(node).map(([x, z]) => toPlan(x, z))
+  const isFullCone = getConicalRoofCoverage(node).fullCircle
 
   const corners: Array<[number, number]> = [
     [-halfWidth, -halfDepth],
@@ -65,7 +69,8 @@ export function buildRoofSegmentFloorplan(
   const palette = view?.palette
   const isSelected = view?.selected ?? false
   const isHighlighted = view?.highlighted ?? false
-  const showSelectedChrome = isSelected || isHighlighted
+  // Moved too: the wall line shows whether it lands on the walls' centre lines.
+  const showSelectedChrome = isSelected || isHighlighted || (view?.moving ?? false)
 
   // Black architectural outline by default; palette accent on select.
   // Mirrors the elevator / column style so all structural elements read
@@ -73,19 +78,33 @@ export function buildRoofSegmentFloorplan(
   const baseInk = '#111111'
   const stroke = showSelectedChrome && palette ? palette.selectedStroke : baseInk
 
+  const footprint: FloorplanGeometry =
+    node.roofType === 'conical' && isFullCone
+      ? {
+          kind: 'circle',
+          cx,
+          cy: cz,
+          r: halfWidth,
+          fill: stroke,
+          fillOpacity: 0,
+          stroke: 'none',
+          strokeWidth: 0,
+          pointerEvents: 'all',
+        }
+      : {
+          kind: 'polygon',
+          points: node.roofType === 'conical' ? conicalFootprint : points,
+          fill: stroke,
+          fillOpacity: 0,
+          stroke: 'none',
+          strokeWidth: 0,
+          pointerEvents: 'all',
+        }
   const children: FloorplanGeometry[] = [
     // Invisible hit-target — full footprint, transparent fill, captures
     // clicks across the entire roof rectangle (so the user doesn't need
     // to pixel-hunt the outline strokes).
-    {
-      kind: 'polygon',
-      points,
-      fill: stroke,
-      fillOpacity: 0,
-      stroke: 'none',
-      strokeWidth: 0,
-      pointerEvents: 'all',
-    },
+    footprint,
   ]
 
   // The segment's own rectangle outline + fill render ONLY while it's
@@ -95,28 +114,38 @@ export function buildRoofSegmentFloorplan(
   // (`buildRoofFloorplan`), so overlapping segments read as one combined
   // shape instead of stacked rectangles. Ridges/hips below always draw.
   if (showSelectedChrome) {
-    children.push({
-      kind: 'polygon',
-      points,
-      fill: '#fed7aa',
-      fillOpacity: 0.55,
-      stroke,
-      strokeWidth: 0.035,
-      strokeLinejoin: 'miter',
-    })
+    children.push(
+      node.roofType === 'conical' && isFullCone
+        ? {
+            kind: 'circle',
+            cx,
+            cy: cz,
+            r: halfWidth,
+            fill: '#fed7aa',
+            fillOpacity: 0.55,
+            stroke,
+            strokeWidth: 0.035,
+          }
+        : {
+            kind: 'polygon',
+            points: node.roofType === 'conical' ? conicalFootprint : points,
+            fill: '#fed7aa',
+            fillOpacity: 0.55,
+            stroke,
+            strokeWidth: 0.035,
+            strokeLinejoin: 'miter',
+          },
+    )
   }
 
   // NOTE: the ridge / hip / break / slope linework is NOT drawn here — the
   // parent roof's builder (`buildRoofFloorplan`) draws it for every segment,
-  // clipped against the merged-roof valleys so a segment's ridge stops at
-  // the junction instead of running on into a neighbour it overlaps. This
-  // builder owns only the per-segment interaction chrome below. The shape
-  // math lives in `getRoofSegmentPlanLinework` (exported for the roof
-  // builder to consume).
+  // while this builder owns only the per-segment interaction chrome below.
+  // The shape math lives in `getRoofSegmentPlanLinework` (exported for the
+  // roof builder to consume).
 
-  // Selection chrome — orange move-handle dot at the centre, four
-  // perpendicular side resize-arrows (width on X, depth on Z), and a
-  // rotate-arrow at the +X/+Z corner. Sister to the 3D handles in
+  // Selection chrome — orange move-handle dot at the centre, footprint
+  // resize arrows, and a rotate-arrow at the +X/+Z corner. Sister to the 3D handles in
   // `definition.ts`. Resize/rotate route through the matching
   // `floorplanAffordances`; the dot drives body-move via
   // `def.floorplanMoveTarget`.
@@ -127,9 +156,8 @@ export function buildRoofSegmentFloorplan(
     })
 
     const sideArrowOffset = 0.12
-    const rotateCornerOffset = 0.22
+    const rotateCornerOffset = 0.3
     const halfW = node.width / 2
-    const halfD = node.depth / 2
     // Effective rotation = parent roof rotation + segment-local rotation.
     // Reuse `cos` / `sin` from the corner computation above (they were
     // computed for the same `rotation` value).
@@ -137,41 +165,62 @@ export function buildRoofSegmentFloorplan(
       lx * cos - ly * sin,
       lx * sin + ly * cos,
     ]
-    const sides: Array<{
-      local: [number, number]
-      localAngle: number
-      axis: 'x' | 'z'
-      side: 1 | -1
-    }> = [
-      { local: [halfW + sideArrowOffset, 0], localAngle: 0, axis: 'x', side: 1 },
-      { local: [-(halfW + sideArrowOffset), 0], localAngle: Math.PI, axis: 'x', side: -1 },
-      { local: [0, halfD + sideArrowOffset], localAngle: Math.PI / 2, axis: 'z', side: 1 },
-      { local: [0, -(halfD + sideArrowOffset)], localAngle: -Math.PI / 2, axis: 'z', side: -1 },
-    ]
-    for (const s of sides) {
-      const [ox, oz] = rotateLocal(s.local[0], s.local[1])
-      const [tx, tz] = rotateLocal(Math.cos(s.localAngle), Math.sin(s.localAngle))
+    if (node.roofType === 'conical') {
+      const [ox, oz] = rotateLocal(halfW + sideArrowOffset, 0)
+      const [tx, tz] = rotateLocal(1, 0)
       children.push({
         kind: 'move-arrow',
         point: [cx + ox, cz + oz],
         angle: Math.atan2(tz, tx),
         affordance: 'roof-segment-resize',
-        payload: { axis: s.axis, side: s.side },
+        payload: { mode: 'radial' },
       })
+    } else {
+      // Past the eaves and rakes the plan outlines, so the arrows sit clear of the roof's edge.
+      const eave = getRoofSegmentVisibleTopBounds(node)
+      const sides: Array<{
+        local: [number, number]
+        localAngle: number
+        axis: 'x' | 'z'
+        side: 1 | -1
+      }> = [
+        { local: [eave.maxX + sideArrowOffset, 0], localAngle: 0, axis: 'x', side: 1 },
+        { local: [eave.minX - sideArrowOffset, 0], localAngle: Math.PI, axis: 'x', side: -1 },
+        { local: [0, eave.maxZ + sideArrowOffset], localAngle: Math.PI / 2, axis: 'z', side: 1 },
+        { local: [0, eave.minZ - sideArrowOffset], localAngle: -Math.PI / 2, axis: 'z', side: -1 },
+      ]
+      for (const side of sides) {
+        const [ox, oz] = rotateLocal(side.local[0], side.local[1])
+        const [tx, tz] = rotateLocal(Math.cos(side.localAngle), Math.sin(side.localAngle))
+        children.push({
+          kind: 'move-arrow',
+          point: [cx + ox, cz + oz],
+          angle: Math.atan2(tz, tx),
+          affordance: 'roof-segment-resize',
+          payload: { axis: side.axis, side: side.side },
+        })
+      }
     }
 
-    // Rotate-arrow at the +X / +Z corner. Local angle π/4 puts the
-    // curved arrow's bow at the diagonal corner so it reads as a
-    // rotation gizmo around the segment centre.
-    const [cornerX, cornerZ] = rotateLocal(halfW + rotateCornerOffset, halfD + rotateCornerOffset)
-    const [radialX, radialZ] = rotateLocal(1, 1)
-    children.push({
-      kind: 'rotate-arrow',
-      point: [cx + cornerX, cz + cornerZ],
-      angle: Math.atan2(radialZ, radialX),
-      affordance: 'roof-segment-rotate',
-      pivot: [cx, cz],
-    })
+    // Rotate-arrow off the +X / +Z corner of the eaves, clear of the plan's
+    // outline, sized to a roof. Local angle π/4 puts the curved arrow's bow
+    // on the diagonal so it reads as a rotation gizmo around the centre.
+    if (node.roofType !== 'conical') {
+      const eave = getRoofSegmentVisibleTopBounds(node)
+      const [cornerX, cornerZ] = rotateLocal(
+        eave.maxX + rotateCornerOffset,
+        eave.maxZ + rotateCornerOffset,
+      )
+      const [radialX, radialZ] = rotateLocal(1, 1)
+      children.push({
+        kind: 'rotate-arrow',
+        point: [cx + cornerX, cz + cornerZ],
+        angle: Math.atan2(radialZ, radialX),
+        affordance: 'roof-segment-rotate',
+        pivot: [cx, cz],
+        scale: 2,
+      })
+    }
   }
 
   return { kind: 'group', children }
@@ -179,6 +228,20 @@ export function buildRoofSegmentFloorplan(
 
 export type PlanPt = readonly [number, number]
 export type PlanSeg = readonly [PlanPt, PlanPt]
+
+export function getConicalRoofPlanFootprint(node: RoofSegmentNode): PlanPt[] {
+  const coverage = getConicalRoofCoverage(node)
+  const sweep = Math.max(
+    -Math.PI * 2,
+    Math.min(Math.PI * 2, Math.abs(coverage.sweepAngle) < 1e-4 ? 1e-4 : coverage.sweepAngle),
+  )
+  const count = Math.max(1, Math.ceil((48 * Math.abs(sweep)) / (Math.PI * 2)))
+  const arc = Array.from({ length: count + 1 }, (_, index) => {
+    const angle = coverage.startAngle + (index / count) * sweep
+    return [Math.cos(angle) * (node.width / 2), Math.sin(angle) * (node.width / 2)] as PlanPt
+  })
+  return Math.abs(sweep) >= Math.PI * 2 - 1e-4 ? arc.slice(0, -1) : [[0, 0], ...arc]
+}
 
 /**
  * Ridge / hip / break linework for a roof segment in segment-local space
@@ -192,8 +255,8 @@ export type PlanSeg = readonly [PlanPt, PlanPt]
  * - break: horizontal fold where the slope angle changes (gambrel kink,
  *          mansard/dutch waist)
  *
- * Exported so the roof-level builder can reuse it to terminate the valley
- * diagonals it draws at merged-roof junctions against the segments' ridges.
+ * Exported so the roof-level builder can reuse the same architectural
+ * linework for the complete roof plan.
  */
 export function getRoofSegmentPlanLinework(node: RoofSegmentNode): {
   ridges: PlanSeg[]
@@ -235,8 +298,10 @@ export function getRoofSegmentPlanLinework(node: RoofSegmentNode): {
   }
 
   switch (node.roofType) {
+    case 'conical':
     case 'flat':
       break
+    case 'barrel':
     case 'gable':
       // Single ridge down the middle along the width axis.
       ridges.push([

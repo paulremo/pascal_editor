@@ -11,18 +11,35 @@ import { Vector3 } from 'three'
 // readers must consume them within the same frame.
 export type PlacementSurface = {
   point: Vector3
+  /** Optional stable origin for the construction lattice. */
+  anchor?: Vector3
   normal: Vector3
+  projection: 'surface' | 'fixed-plane'
 }
 
 const surface: PlacementSurface = {
   point: new Vector3(),
+  anchor: new Vector3(),
   normal: new Vector3(0, 1, 0),
+  projection: 'surface',
 }
 let active = false
 
-export function publishPlacementSurface(point: Vector3, normal: Vector3): void {
+export function publishPlacementSurface(
+  point: Vector3,
+  normal: Vector3,
+  projection: PlacementSurface['projection'] = 'surface',
+  anchor?: Vector3,
+): void {
   surface.point.copy(point)
+  if (anchor) {
+    surface.anchor ??= new Vector3()
+    surface.anchor.copy(anchor)
+  } else {
+    surface.anchor = undefined
+  }
   surface.normal.copy(normal)
+  surface.projection = projection
   active = true
 }
 
@@ -32,4 +49,8 @@ export function clearPlacementSurface(): void {
 
 export function getPlacementSurface(): PlacementSurface | null {
   return active ? surface : null
+}
+
+export function usesOrientedPlacementPlane(normal: Vector3): boolean {
+  return Math.abs(normal.y) < 0.95
 }

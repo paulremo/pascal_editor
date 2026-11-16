@@ -22,6 +22,8 @@ import {
   csgEvaluator,
   generateRoofSegmentGeometry,
   INTERSECTION,
+  isTypingTarget,
+  markPureRaycast,
   prepareBrushForCSG,
   useViewer,
 } from '@pascal-app/viewer'
@@ -31,6 +33,7 @@ import * as THREE from 'three'
 import { mergeVertices } from 'three/examples/jsm/utils/BufferGeometryUtils.js'
 import { LineBasicNodeMaterial, MeshBasicNodeMaterial } from 'three/webgpu'
 import { EDITOR_LAYER } from '../../../lib/constants'
+import { isHistoryShortcut } from '../../../lib/history'
 import { getHoveredRoofSegmentOutlineProxyName } from '../../../lib/roof-hover-outline-proxy'
 import useInteractionScope, { useMovingNode } from '../../../store/use-interaction-scope'
 import { swallowNextClick } from '../../editor/handles/use-handle-drag'
@@ -509,6 +512,7 @@ function segmentShapeKey(segment: RoofSegmentNode): string {
     segment.wallThickness,
     segment.deckThickness,
     segment.overhang,
+    segment.gableOverhang,
     segment.shingleThickness,
     segment.gambrelLowerWidthRatio,
     segment.gambrelLowerHeightRatio,
@@ -706,7 +710,7 @@ function makeExpandedTrimRaycast(
   const halfX = Math.max(0.5, hitScale[0] / Math.max(visualScale[0], 1e-6) / 2)
   const halfY = Math.max(0.5, hitScale[1] / Math.max(visualScale[1], 1e-6) / 2)
   const halfZ = Math.max(0.5, hitScale[2] / Math.max(visualScale[2], 1e-6) / 2)
-  return function expandedTrimRaycast(
+  return markPureRaycast(function expandedTrimRaycast(
     this: THREE.Mesh,
     raycaster: THREE.Raycaster,
     intersects: THREE.Intersection[],
@@ -721,7 +725,7 @@ function makeExpandedTrimRaycast(
     const distance = raycaster.ray.origin.distanceTo(point)
     if (distance < raycaster.near || distance > raycaster.far) return
     intersects.push({ distance, point, object: this })
-  }
+  })
 }
 
 function trimEquals(a: RoofSegmentTrim, b: RoofSegmentTrim): boolean {
@@ -1003,15 +1007,6 @@ function getTrimCursor(side: RoofTrimSide): string {
   }
 }
 
-function shouldShowTrimPlanes(metadata: unknown): boolean {
-  return (
-    typeof metadata === 'object' &&
-    metadata !== null &&
-    !Array.isArray(metadata) &&
-    (metadata as Record<string, unknown>).showTrimPlanes === true
-  )
-}
-
 function commitSegmentTrim(segment: RoofSegmentNode, trim: RoofSegmentTrim) {
   const scene = useScene.getState()
   scene.applyNodeChanges({
@@ -1028,6 +1023,28 @@ function RoofTrimHandles() {
     return node?.type === 'roof-segment' ? (node as RoofSegmentNode) : null
   })
   const readOnly = useScene((s) => s.readOnly)
+  const showTrimPlanes = useInteractionScope(
+    (s) =>
+      s.scope.kind === 'reshaping' && s.scope.reshape === 'trim' && s.scope.nodeId === selectedId,
+  )
+  useEffect(() => {
+    const end = () =>
+      useInteractionScope
+        .getState()
+        .endIf(
+          (scope) =>
+            scope.kind === 'reshaping' && scope.reshape === 'trim' && scope.nodeId === selectedId,
+        )
+    const onKey = (event: KeyboardEvent) => {
+      if (isTypingTarget(event.target)) return
+      if (event.key === 'Escape') end()
+    }
+    window.addEventListener('keydown', onKey)
+    return () => {
+      window.removeEventListener('keydown', onKey)
+      end()
+    }
+  }, [selectedId])
   const liveOverrideKey = useLiveNodeOverrides((s) =>
     segment ? JSON.stringify(s.overrides.get(segment.id) ?? null) : null,
   )
@@ -1039,7 +1056,10 @@ function RoofTrimHandles() {
   const zoom = camera instanceof THREE.OrthographicCamera ? 1 / camera.zoom : 1
   const handleBaseScale = zoom * TRIM_HANDLE_BASE_SCALE
 
-  useEffect(() => () => dragCleanupRef.current?.(), [])
+  useEffect(() => {
+    if (!selectedId || !showTrimPlanes || readOnly) dragCleanupRef.current?.()
+    return () => dragCleanupRef.current?.()
+  }, [selectedId, showTrimPlanes, readOnly])
 
   const liveSegment = useMemo(() => {
     if (!segment) return null
@@ -1055,8 +1075,6 @@ function RoofTrimHandles() {
     groupRef.current.matrix.copy(source.matrixWorld)
     groupRef.current.matrixAutoUpdate = false
   })
-
-  const showTrimPlanes = shouldShowTrimPlanes(liveSegment?.metadata)
 
   if (readOnly || !segment || !liveSegment || !showTrimPlanes) return null
 
@@ -1250,6 +1268,7 @@ function RoofTrimHandles() {
   }
 
   const startDrag = (side: RoofTrimSide, event: ThreeEvent<PointerEvent>) => {
+    if (event.button !== 0) return
     event.stopPropagation()
     const source = sceneRegistry.nodes.get(segment.id)
     if (!source) return
@@ -1310,9 +1329,7 @@ function RoofTrimHandles() {
 
     document.body.style.cursor = getTrimCursor(side)
     setDraggingSide(side)
-    useInteractionScope
-      .getState()
-      .begin({ kind: 'handle-drag', nodeId: segmentId, handle: getTrimLabel(side) })
+
     useViewer.getState().setInputDragging(true)
     useScene.temporal.getState().pause()
 
@@ -1340,6 +1357,7 @@ function RoofTrimHandles() {
       window.removeEventListener('pointermove', onMove)
       window.removeEventListener('pointerup', onUp)
       window.removeEventListener('pointercancel', onCancel)
+      window.removeEventListener('keydown', onKeyDown, true)
       if (
         document.body.style.cursor === 'ew-resize' ||
         document.body.style.cursor === 'ns-resize' ||
@@ -1350,9 +1368,7 @@ function RoofTrimHandles() {
         document.body.style.cursor = ''
       }
       useScene.temporal.getState().resume()
-      useInteractionScope
-        .getState()
-        .endIf((scope) => scope.kind === 'handle-drag' && scope.nodeId === segmentId)
+
       useViewer.getState().setInputDragging(false)
       setDraggingSide(null)
       dragCleanupRef.current = null
@@ -1378,10 +1394,21 @@ function RoofTrimHandles() {
       cleanup()
     }
 
-    dragCleanupRef.current = cleanup
+    // Escape / ⌘Z abort the trim drag — capture phase so they win over the
+    // global use-keyboard arms (⌘Z must never history-jump mid-gesture).
+    const onKeyDown = (e: KeyboardEvent) => {
+      if (e.key !== 'Escape' && !isHistoryShortcut(e)) return
+      e.preventDefault()
+      e.stopPropagation()
+      swallowNextClick()
+      onCancel()
+    }
+
+    dragCleanupRef.current = onCancel
     window.addEventListener('pointermove', onMove)
     window.addEventListener('pointerup', onUp)
     window.addEventListener('pointercancel', onCancel)
+    window.addEventListener('keydown', onKeyDown, true)
   }
 
   const renderTrimPlane = (
@@ -1774,16 +1801,14 @@ export const RoofEditSystem = () => {
   useEffect(() => {
     const nodes = useScene.getState().nodes
 
-    // Roofs where a segment itself is selected -> full edit mode (hide
-    // merged, show wrapper).
+    // Roofs where a segment itself is selected enter full edit mode.
     const activeRoofIds = new Set<string>()
     // Roofs where an accessory (dormer/chimney/etc.) is selected -> only
     // reveal the wrapper so handle portals into the segment mesh become
     // visible. Merged stays on.
     const revealRoofIds = new Set<string>()
-    // Roofs whose selected segment is currently being moved in 3D. During this
-    // transient state we reveal the wrapper so the moving segment mesh is
-    // visible and hide the merged roof to avoid the duplicate shell fighting it.
+    // Roofs whose selected segment is currently being moved in 3D. The merged
+    // roof remains the visual source and rebuilds from the live move override.
     const movingRoofIds = new Set<string>()
 
     for (const id of selectedIds) {
@@ -1828,14 +1853,8 @@ export const RoofEditSystem = () => {
       const isMoving = movingRoofIds.has(roofId)
       const isReveal = revealRoofIds.has(roofId)
 
-      // Keep the clean merged shell visible during trim editing too (not just
-      // when deselected). The merged shell rebuilds live from each segment's
-      // trim override (RoofSystem reads getEffectiveNode), so the dragged
-      // cutaway matches the commit. Showing the individual per-segment meshes
-      // instead would expose their abutting end-cap faces (the white planes the
-      // merged union removes) — exactly what the commit doesn't show.
-      if (mergedMesh) mergedMesh.visible = !isMoving
-      if (segmentsWrapper) segmentsWrapper.visible = isReveal || isMoving
+      if (mergedMesh) mergedMesh.visible = true
+      if (segmentsWrapper) segmentsWrapper.visible = isReveal
 
       const roofNode = nodes[roofId as AnyNodeId] as RoofNode | undefined
       if (roofNode?.children?.length) {
@@ -1843,13 +1862,12 @@ export const RoofEditSystem = () => {
         const wasMoving = prevMovingRoofIds.current.has(roofId)
         const wasReveal = prevRevealRoofIds.current.has(roofId)
         if (isActive !== wasActive || isMoving !== wasMoving) {
-          // Entering / exiting full edit mode: rebuild segment / merged
-          // geometries. Segment-move reveal uses the same rebuild so any
-          // wrapper mesh previously stripped to an empty placeholder is
-          // restored before the drag begins.
+          // Entering or exiting edit and move modes rebuilds the merged shell
+          // from the current segment values (its faces of other kinds are no part of it).
           const { markDirty } = useScene.getState()
           for (const childId of roofNode.children) {
-            markDirty(childId as AnyNodeId)
+            if (nodes[childId as AnyNodeId]?.type === 'roof-segment')
+              markDirty(childId as AnyNodeId)
           }
         }
         // Entering reveal mode (and NOT also full-edit, which already

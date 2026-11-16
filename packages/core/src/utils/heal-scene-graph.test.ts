@@ -1,7 +1,29 @@
 import { describe, expect, test } from 'bun:test'
-import { healSceneNodes } from './heal-scene-graph'
+import { healSceneNodes, repairClaimedParentLinks, repairHostChildLinks } from './heal-scene-graph'
 
 describe('healSceneNodes', () => {
+  test('repairs missing reverse child links on saved hosts without mutating source nodes', () => {
+    const input = {
+      site_a: { id: 'site_a', type: 'site', parentId: null },
+      building_a: { id: 'building_a', type: 'building', parentId: 'site_a' },
+      level_a: { id: 'level_a', type: 'level', parentId: 'building_a', children: ['item_a'] },
+      item_a: { id: 'item_a', type: 'item', parentId: 'level_a', children: [] },
+      item_b: { id: 'item_b', type: 'item', parentId: 'item_a' },
+    }
+    const snapshot = structuredClone(input)
+    const healed = healSceneNodes(input)
+    expect(healed.nodes.site_a).toMatchObject({ children: ['building_a'] })
+    expect(healed.nodes.building_a).toMatchObject({ children: ['level_a'] })
+    expect(healed.nodes.item_a).toMatchObject({ children: ['item_b'] })
+    expect(healed.nodes.level_a).toBe(input.level_a)
+    expect(input).toEqual(snapshot)
+    expect(healSceneNodes(healed.nodes).repairedChildLinkNodeIds).toEqual([])
+    expect(healSceneNodes(healed.nodes).nodes).toEqual(healed.nodes)
+    expect(healSceneNodes(Object.fromEntries(Object.entries(input).reverse())).nodes).toEqual(
+      healed.nodes,
+    )
+  })
+
   test('strips non-string (null) children entries', () => {
     const { nodes, strippedChildRefs } = healSceneNodes({
       wall_a: {
@@ -15,6 +37,28 @@ describe('healSceneNodes', () => {
     })
     expect(strippedChildRefs).toBe(1)
     expect((nodes.wall_a as { children: string[] }).children).toEqual(['item_x'])
+  })
+
+  test('preserves legacy embedded site children for the scene migration', () => {
+    const building = {
+      id: 'building_legacy',
+      type: 'building',
+      parentId: null,
+      children: ['level_legacy'],
+    }
+    const { nodes, strippedChildRefs } = healSceneNodes({
+      site_legacy: {
+        id: 'site_legacy',
+        type: 'site',
+        parentId: null,
+        children: [building, null],
+      },
+      building_legacy: building,
+      level_legacy: { id: 'level_legacy', type: 'level', parentId: null, children: [] },
+    })
+
+    expect(strippedChildRefs).toBe(1)
+    expect((nodes.site_legacy as { children: unknown[] }).children).toEqual([building])
   })
 
   test('drops childless zero-length walls and removes their parent reference', () => {
@@ -91,5 +135,82 @@ describe('healSceneNodes', () => {
     const { nodes, strippedStaleChildRefs } = healSceneNodes(input)
     expect(strippedStaleChildRefs).toBe(0)
     expect(nodes.wall_a).toBe(input.wall_a)
+  })
+
+  test('repairs null parent links down a site → building → level chain', () => {
+    // The exact stored-production corruption behind "Live collaboration is
+    // unavailable": children arrays link the chain but building/level carry
+    // parentId null, so the authority's symmetry validation rejected the scene.
+    const { nodes, repairedParentLinkNodeIds } = healSceneNodes({
+      site_a: { id: 'site_a', type: 'site', parentId: null, children: ['building_a'] },
+      building_a: { id: 'building_a', type: 'building', parentId: null, children: ['level_a'] },
+      level_a: { id: 'level_a', type: 'level', parentId: null, children: ['wall_a'] },
+      wall_a: { id: 'wall_a', type: 'wall', parentId: 'level_a', start: [0, 0], end: [2, 0] },
+    })
+    expect(repairedParentLinkNodeIds.sort()).toEqual(['building_a', 'level_a'])
+    expect((nodes.building_a as { parentId: string }).parentId).toBe('site_a')
+    expect((nodes.level_a as { parentId: string }).parentId).toBe('building_a')
+    expect((nodes.site_a as { parentId: null }).parentId).toBeNull()
+  })
+
+  test('repairs a null parent link claimed through an embedded legacy site child', () => {
+    const embeddedBuilding = {
+      id: 'building_legacy',
+      type: 'building',
+      parentId: null,
+      children: [],
+    }
+    const { nodes, repairedParentLinkNodeIds } = healSceneNodes({
+      site_legacy: {
+        id: 'site_legacy',
+        type: 'site',
+        parentId: null,
+        children: [embeddedBuilding],
+      },
+      building_legacy: embeddedBuilding,
+    })
+    expect(repairedParentLinkNodeIds).toEqual(['building_legacy'])
+    expect((nodes.building_legacy as { parentId: string }).parentId).toBe('site_legacy')
+  })
+
+  test('leaves a null parent link alone when multiple parents claim the node', () => {
+    const { nodes, repairedParentLinkNodeIds } = healSceneNodes({
+      level_a: { id: 'level_a', type: 'level', parentId: null, children: ['item_x'] },
+      level_b: { id: 'level_b', type: 'level', parentId: null, children: ['item_x'] },
+      item_x: { id: 'item_x', type: 'item', parentId: null },
+    })
+    expect(repairedParentLinkNodeIds).toEqual([])
+    expect((nodes.item_x as { parentId: null }).parentId).toBeNull()
+  })
+
+  test('leaves an unclaimed root and an existing string parentId alone', () => {
+    const { nodes, repairedParentLinkNodeIds } = healSceneNodes({
+      site_root: { id: 'site_root', type: 'site', parentId: null, children: ['building_a'] },
+      building_a: {
+        id: 'building_a',
+        type: 'building',
+        parentId: 'site_root',
+        children: ['level_gone'],
+      },
+      level_gone: { id: 'level_gone', type: 'level', parentId: 'building_missing', children: [] },
+    })
+    expect(repairedParentLinkNodeIds).toEqual([])
+    expect((nodes.site_root as { parentId: null }).parentId).toBeNull()
+    expect((nodes.level_gone as { parentId: string }).parentId).toBe('building_missing')
+  })
+
+  // The hosted MCP's load runs the parent repair and this one alone: a level stored without
+  // children gets the same list, in the same order, as the editor's whole heal gives it.
+  test('a level stored without children lists the nodes naming it in scene order, on either load', () => {
+    const input = {
+      level_a: { id: 'level_a', type: 'level', parentId: null },
+      column_z: { id: 'column_z', type: 'column', parentId: 'level_a' },
+      column_a: { id: 'column_a', type: 'column', parentId: 'level_a' },
+    }
+    const healed = healSceneNodes(input)
+    expect(healed.nodes.level_a).toMatchObject({ children: ['column_z', 'column_a'] })
+    expect(healed.repairedChildLinkNodeIds).toEqual(['level_a'])
+    const loaded = repairHostChildLinks(repairClaimedParentLinks(input).nodes)
+    expect(loaded.nodes).toEqual(healed.nodes)
   })
 })
