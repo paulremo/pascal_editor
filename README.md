@@ -396,7 +396,8 @@ $env:PORT = "3000"
 $env:MINT_PASCAL_HOST_ORIGIN = "http://localhost:3000"
 $env:PASCAL_DATA_DIR = "$env:LOCALAPPDATA\Pascal\data"
 
-bun --cwd apps/editor run start
+Set-Location apps/editor
+bun run start
 ```
 
 Open http://localhost:3000. `PASCAL_DATA_DIR` keeps the local SQLite scene
