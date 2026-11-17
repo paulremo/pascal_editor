@@ -7,7 +7,7 @@ export const fireRiskHostPanel: EditorHostPanel = {
   category: 'Analysis',
   summary: 'Tag rooms and exits and export geometry for fire-risk analysis.',
   description:
-    'Annotate room zones and doors for CFAST and evacuation workflows, then download the scene for the fire-risk engine.',
+    'Annotate rooms and doors for CFAST and evacuation workflows, then download the scene for the fire-risk engine. Manually drawn analysis zones are optional.',
   defaultInstalled: false,
   icon: { kind: 'iconify', name: 'lucide:flame' },
   component: () => import('./panel'),
