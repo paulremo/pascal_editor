@@ -250,7 +250,6 @@ See [SETUP.md](SETUP.md) for prerequisites and environment variables,
 [docs/architecture.md](docs/architecture.md) for how the packages fit together, and
 [docs/releasing.md](docs/releasing.md) for npm, container, and MCP Registry publishing.
 
-<<<<<<< HEAD
 ### Local production instance
 
 To run a complete local Pascal instance from this checkout, rather than the
@@ -276,11 +275,7 @@ database outside the repository; use the same location between launches to
 retain scenes. Stop the instance with `Ctrl+C`. Do not use `bun dev` for this
 production-instance workflow.
 
-### Building for Production
-=======
 ### Build a plugin
->>>>>>> origin/main
-
 A plugin ships node kinds (schema, 3D/2D rendering, placement tools, inspector parametrics) and
 left-rail panels through the same `Plugin` manifest the built-ins use. Start with the
 [plugin guide](https://editor.pascal.app/docs/developers/plugins) and the worked example

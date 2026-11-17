@@ -54,19 +54,22 @@ function Toggle({
   return (
     <label className="flex cursor-pointer items-center justify-between gap-3 text-sm">
       <span className="text-sidebar-foreground/70">{label}</span>
-      <input checked={checked} onChange={(event) => onChange(event.target.checked)} type="checkbox" />
+      <input
+        checked={checked}
+        onChange={(event) => onChange(event.target.checked)}
+        type="checkbox"
+      />
     </label>
   )
 }
 
 export default function FireRiskPanel() {
-  const selectedId = useViewer((state) =>
-    (state.selection.selectedIds[0] ?? state.selection.zoneId ?? null) as AnyNodeId | null,
+  const selectedId = useViewer(
+    (state) =>
+      (state.selection.selectedIds[0] ?? state.selection.zoneId ?? null) as AnyNodeId | null,
   )
   const node = useScene((state) => (selectedId ? state.nodes[selectedId] : undefined))
   const updateNode = useScene((state) => state.updateNode)
-  const nodes = useScene((state) => state.nodes)
-  const rootNodeIds = useScene((state) => state.rootNodeIds)
   const isSupported = node?.type === 'zone' || node?.type === 'door'
   const metadata = asRecord(node?.metadata)
   const fireRisk = asRecord(metadata.fireRisk)
@@ -90,7 +93,8 @@ export default function FireRiskPanel() {
       <header>
         <h2 className="font-semibold text-base">Fire risk</h2>
         <p className="mt-1 text-sidebar-foreground/60 text-xs">
-          Tag explicit room zones and wall-hosted doors, then export geometry for the fire-risk engine.
+          Tag explicit room zones and wall-hosted doors, then export geometry for the fire-risk
+          engine.
         </p>
       </header>
 
@@ -160,7 +164,10 @@ export default function FireRiskPanel() {
       <div className="mt-auto border-sidebar-border border-t pt-4">
         <button
           className="w-full rounded-md bg-primary px-3 py-2 font-medium text-primary-foreground text-sm hover:bg-primary/90"
-          onClick={() => downloadFireRiskScene(nodes as Record<string, unknown>, rootNodeIds)}
+          onClick={() => {
+            const { nodes, rootNodeIds } = useScene.getState()
+            downloadFireRiskScene(nodes as Record<string, unknown>, rootNodeIds)
+          }}
           type="button"
         >
           Export fire-risk geometry
